@@ -187,6 +187,69 @@ def main(manifest: str) -> None:
         server.shutdown()
     print("OK · gateway Postgres wire: motor por conexión")
     probar_ejecucion(manifest)
+    probar_npgsql(manifest)
+
+
+def probar_npgsql(manifest: str) -> None:
+    """Power BI (Npgsql): catálogo de tipos al conectar y protocolo extendido con error a mitad de lote."""
+    import hashlib
+    import socket
+    import struct
+
+    tipos = ("SELECT ns.nspname, a.typname, a.oid, a.typrelid, a.typbasetype, CASE WHEN pg_proc.proname='array_recv' "
+             "THEN 'a' ELSE a.typtype END AS type, CASE WHEN pg_proc.proname='array_recv' THEN a.typelem ELSE 0 END "
+             "AS elemoid, 0 AS ord FROM pg_type AS a JOIN pg_namespace AS ns ON (ns.oid = a.typnamespace) "
+             "JOIN pg_proc ON pg_proc.oid = a.typreceive LEFT OUTER JOIN pg_range ON (pg_range.rngtypid = a.oid)")
+    compuestos = ("SELECT typ.oid, att.attname, att.atttypid FROM pg_type AS typ JOIN pg_attribute AS att "
+                  "ON (att.attrelid = typ.typrelid) WHERE typ.typtype = 'c' AND attnum > 0")
+    enums = "SELECT pg_type.oid, enumlabel FROM pg_enum JOIN pg_type ON pg_type.oid=enumtypid ORDER BY oid"
+
+    port = _free_port()
+    server = start_in_thread("127.0.0.1", port, "bi", "bi", manifest, "athena")
+    try:
+        sock = socket.create_connection(("127.0.0.1", port))
+
+        def leer():
+            tipo = sock.recv(1)
+            largo = struct.unpack("!i", sock.recv(4))[0]
+            datos = b""
+            while len(datos) < largo - 4:
+                datos += sock.recv(largo - 4 - len(datos))
+            return tipo, datos
+
+        def mensaje(tipo, cuerpo):
+            return tipo + struct.pack("!i", len(cuerpo) + 4) + cuerpo
+
+        cuerpo = struct.pack("!i", 196608) + b"user\0bi\0database\0athena\0\0"
+        sock.sendall(struct.pack("!i", len(cuerpo) + 4) + cuerpo)
+        sal = leer()[1][4:8]
+        clave = hashlib.md5(hashlib.md5(b"bibi").hexdigest().encode() + sal).hexdigest()
+        sock.sendall(mensaje(b"p", b"md5" + clave.encode() + b"\0"))
+        while leer()[0] != b"Z":
+            pass
+
+        def lote(consultas):
+            salida = b""
+            for q in consultas:
+                salida += mensaje(b"P", b"\0" + q.encode() + b"\0" + struct.pack("!h", 0))
+                salida += mensaje(b"B", b"\0\0" + struct.pack("!hhh", 0, 0, 0))
+                salida += mensaje(b"D", b"P\0")
+                salida += mensaje(b"E", b"\0" + struct.pack("!i", 0))
+            sock.sendall(salida + mensaje(b"S", b""))
+            secuencia = ""
+            while True:
+                tipo = leer()[0].decode()
+                secuencia += tipo
+                if tipo == "Z":
+                    return secuencia
+
+        r = lote([tipos, compuestos, enums])
+        assert "E" not in r and r.count("D") > 20 and r.count("C") == 3, r       # tres resultados, sin error
+        assert lote(["SELECT x FROM tabla_que_no_existe", enums]) == "12EZ"      # tras el error: nada hasta Sync
+        sock.close()
+    finally:
+        server.shutdown()
+    print("OK · Npgsql (Power BI): tipos al conectar y error a mitad de lote")
 
 
 class _EjecutorFalso:

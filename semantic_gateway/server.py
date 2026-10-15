@@ -384,6 +384,47 @@ def _literales_arreglo(sql: str) -> str:
     return _ARREGLO_TEXTO.sub(a_lista, sql)
 
 
+# Tipos que se informan a Npgsql (driver de Power BI) al conectar: (oid, nombre, typtype, oid del elemento si es arreglo)
+_NPGSQL_TIPOS = [
+    (16, "bool", "b", None), (17, "bytea", "b", None), (18, "char", "b", None), (19, "name", "b", None),
+    (20, "int8", "b", None), (21, "int2", "b", None), (23, "int4", "b", None), (25, "text", "b", None),
+    (26, "oid", "b", None), (114, "json", "b", None), (700, "float4", "b", None), (701, "float8", "b", None),
+    (1042, "bpchar", "b", None), (1043, "varchar", "b", None), (1082, "date", "b", None), (1083, "time", "b", None),
+    (1114, "timestamp", "b", None), (1184, "timestamptz", "b", None), (1186, "interval", "b", None),
+    (1700, "numeric", "b", None), (2950, "uuid", "b", None), (3802, "jsonb", "b", None),
+    (2249, "record", "p", None), (2278, "void", "p", None),
+    (1000, "_bool", "a", 16), (1001, "_bytea", "a", 17), (1002, "_char", "a", 18), (1003, "_name", "a", 19),
+    (1005, "_int2", "a", 21), (1007, "_int4", "a", 23), (1009, "_text", "a", 25), (1014, "_bpchar", "a", 1042),
+    (1015, "_varchar", "a", 1043), (1016, "_int8", "a", 20), (1021, "_float4", "a", 700), (1022, "_float8", "a", 701),
+    (1028, "_oid", "a", 26), (1115, "_timestamp", "a", 1114), (1182, "_date", "a", 1082), (1183, "_time", "a", 1083),
+    (1185, "_timestamptz", "a", 1184), (1187, "_interval", "a", 1186), (1231, "_numeric", "a", 1700),
+    (199, "_json", "a", 114), (2951, "_uuid", "a", 2950), (3807, "_jsonb", "a", 3802),
+]
+
+
+def _consulta_npgsql(sql: str) -> str | None:
+    """Consultas de catálogo que Npgsql (Power BI) envía al conectar y que DuckDB no puede responder.
+
+    * tipos (`pg_type` + `typreceive`/`array_recv` + `pg_range`): lista fija de tipos base y sus arreglos;
+    * campos de tipos compuestos (`attname`, `atttypid`): sin filas;
+    * etiquetas de enums (`pg_enum`): sin filas.
+    Npgsql pide estos resultados como texto y los lee por nombre de columna; se incluyen los nombres de 4.0 y 4.1+.
+    """
+    texto = sql.lower()
+    if "typreceive" in texto and "array_recv" in texto:
+        filas = ", ".join(
+            "('pg_catalog', '{1}', '{0}', '0', '0', '{2}', '{2}', {3}, {3}, '{4}')".format(
+                oid, nombre, tipo, f"'{elem}'" if elem else "NULL", 3 if tipo == "a" else 0)
+            for oid, nombre, tipo, elem in _NPGSQL_TIPOS)
+        return ("SELECT * FROM (VALUES " + filas + ") AS t(nspname, typname, oid, typrelid, typbasetype, type, "
+                "typtype, elemoid, elemtypoid, ord) ORDER BY ord")
+    if "atttypid" in texto and "attname" in texto and "typtype" in texto and "pg_attribute" in texto:
+        return "SELECT NULL::VARCHAR AS oid, NULL::VARCHAR AS attname, NULL::VARCHAR AS atttypid WHERE false"
+    if "enumlabel" in texto and "pg_enum" in texto:
+        return "SELECT NULL::VARCHAR AS oid, NULL::VARCHAR AS enumlabel WHERE false"
+    return None
+
+
 class SemanticRewriter(rewrite.Rewriter):
     """Adapta al dialecto DuckDB las consultas de catálogo; las semánticas pasan intactas al traductor."""
 
@@ -400,6 +441,9 @@ class SemanticRewriter(rewrite.Rewriter):
             return "SELECT 'PostgreSQL 14.0 (gateway semántico sobre MetricFlow)' AS version"
         if re.match(r"\s*(begin|start\s+transaction)\b", sql, flags=re.I):
             return "BEGIN"  # BEGIN READ ONLY / ISOLATION LEVEL … no existen en DuckDB
+        npgsql = _consulta_npgsql(sql)
+        if npgsql is not None:
+            return npgsql
         if "_pg_expandarray" in sql:  # getPrimaryKeys de JDBC: la capa semántica no tiene claves primarias
             columnas = ("TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "COLUMN_NAME", "KEY_SEQ", "PK_NAME")
             n = max([int(i) for i in re.findall(r"\$(\d+)", sql)] or [0])  # la consulta original recibe n parámetros
@@ -434,6 +478,25 @@ class MotorHandler(postgres.BuenaVistaHandler):
             self.send_ready_for_query(ctx)
             return
         super().handle_query(ctx, payload)
+
+    # Protocolo extendido: después de un ErrorResponse, PostgreSQL descarta los mensajes hasta el Sync. buenavista
+    # seguía respondiendo ParseComplete/BindComplete y Npgsql (Power BI) cortaba la conexión con
+    # "Received unexpected backend message ParseComplete".
+    def handle_parse(self, ctx, payload):
+        if not ctx.has_error:
+            super().handle_parse(ctx, payload)
+
+    def handle_bind(self, ctx, payload):
+        if not ctx.has_error:
+            super().handle_bind(ctx, payload)
+
+    def handle_describe(self, ctx, payload):
+        if not ctx.has_error:
+            super().handle_describe(ctx, payload)
+
+    def handle_close(self, ctx, payload):
+        if not ctx.has_error:
+            super().handle_close(ctx, payload)
 
     def handle_startup(self, conn):
         ctx = super().handle_startup(conn)
