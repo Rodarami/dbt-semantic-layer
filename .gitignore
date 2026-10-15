@@ -1,0 +1,25 @@
+
+target/
+dbt_packages/
+logs/
+
+# Entornos virtuales (no se suben; se recrean con pip install -r requirements)
+dbt_venv/
+.venv/
+venv/
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Sistema y dbt local
+.DS_Store
+.user.yml
+
+# Secretos locales
+.env
+.env.*
+
+# Copias de seguridad locales
+backup/

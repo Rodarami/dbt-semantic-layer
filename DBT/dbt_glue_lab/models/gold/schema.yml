@@ -1,0 +1,62 @@
+version: 2
+
+models:
+  # ---------------------------------------------------------------------------
+  # gold_top_item  ·  grano: 1 fila por (item_id, event_year)
+  # ---------------------------------------------------------------------------
+  - name: gold_top_item
+    description: "Ranking anual de items por cantidad de vistas, con plataforma más usada."
+
+    semantic_model:
+      enabled: true
+      name: top_items
+
+    # Grano compuesto (item_id, event_year): no hay una llave primaria simple,
+    # por eso se declara `primary_entity` a nivel de modelo.
+    primary_entity: item
+
+    # No existe una columna fecha/timestamp en este modelo (sólo event_year INT),
+    # por eso se expone sólo como fuente de entidades/dimensiones. Las métricas de
+    # vistas se calculan desde `events` (silver_event).
+    # Para agregar métricas aquí, añadir una columna date (p.ej. make_date(event_year,1,1))
+    # y declararla como dimension time + agg_time_dimension.
+
+    columns:
+      - name: item_id
+        description: "Identificador del item (FK a silver_item)."
+        data_type: bigint
+        entity:
+          type: foreign
+          name: item
+
+      # item_name y category ya existen como dimensiones en el semantic model
+      # `items` (silver_item); se alcanzan vía la entidad `item` (ej: item__category).
+      - name: item_name
+        description: "Nombre del item."
+        data_type: string
+
+      - name: category
+        description: "Categoría del item."
+        data_type: string
+
+      - name: event_year
+        description: "Año de las vistas."
+        data_type: int
+        dimension:
+          type: categorical
+
+      - name: most_used_platform
+        description: "Plataforma con más vistas del item en el año."
+        data_type: string
+        dimension:
+          type: categorical
+
+      - name: item_rank_in_year
+        description: "Posición del item en el ranking anual por vistas (RANK)."
+        data_type: int
+        dimension:
+          type: categorical
+
+      - name: total_views
+        description: "Total de vistas del item en el año."
+        data_type: bigint

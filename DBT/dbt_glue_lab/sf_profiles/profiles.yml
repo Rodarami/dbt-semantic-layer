@@ -1,0 +1,23 @@
+# Perfil de Snowflake SOLO para generar el semantic_manifest.json con los nombres
+# de tabla de Snowflake (BASE.ESQUEMA.TABLA). Mismo nombre de perfil que dbt_project.yml.
+#
+# - `dbt parse` NO se conecta al warehouse: sirven los valores por defecto de abajo.
+# - Para consultar de verdad con `mf` (o el servidor), define las variables de entorno
+#   SNOWFLAKE_* con credenciales reales. No escribas contraseñas en este archivo.
+#
+# Uso:
+#   export DBT_PROFILES_DIR=$PWD/sf_profiles
+#   dbt parse        # -> target/semantic_manifest.json
+dbt_glue_lab:
+  target: sf
+  outputs:
+    sf:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT', 'xy12345.us-east-1') }}"
+      user: "{{ env_var('SNOWFLAKE_USER', 'dummy') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD', 'dummy') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'dummy') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'dummy') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'ANALYTICS') }}"   # base donde estarán las tablas Iceberg
+      schema: "{{ env_var('SNOWFLAKE_SCHEMA', 'lab_data') }}"        # prefijo: los modelos agregan _silver / _gold
+      threads: 1

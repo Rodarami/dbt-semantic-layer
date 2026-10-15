@@ -1,0 +1,551 @@
+{
+  "semantic_models": [
+    {
+      "name": "employee_headcount",
+      "defaults": {
+        "agg_time_dimension": "process_date"
+      },
+      "description": "Snapshot vigente de dotación IT People",
+      "node_relation": {
+        "alias": "fact_empleado",
+        "schema_name": "dlk_gld_it_people_dwh",
+        "database": "dlk_slv_it_people_odm",
+        "relation_name": "dlk_gld_it_people_dwh.fact_empleado"
+      },
+      "primary_entity": null,
+      "entities": [
+        {
+          "name": "employee",
+          "description": null,
+          "type": "primary",
+          "role": null,
+          "expr": "user_ad",
+          "metadata": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        },
+        {
+          "name": "management",
+          "description": null,
+          "type": "foreign",
+          "role": null,
+          "expr": "management_id",
+          "metadata": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        },
+        {
+          "name": "supplier",
+          "description": null,
+          "type": "foreign",
+          "role": null,
+          "expr": "supplier_id",
+          "metadata": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        },
+        {
+          "name": "employee_type",
+          "description": null,
+          "type": "foreign",
+          "role": null,
+          "expr": "type_id",
+          "metadata": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        }
+      ],
+      "measures": [
+        {
+          "name": "employees",
+          "agg": "count_distinct",
+          "description": "Cantidad total de colaboradores",
+          "create_metric": false,
+          "expr": "user_ad",
+          "agg_params": null,
+          "metadata": null,
+          "non_additive_dimension": null,
+          "agg_time_dimension": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        },
+        {
+          "name": "internals",
+          "agg": "sum",
+          "description": "Cantidad total de colaboradores internos",
+          "create_metric": false,
+          "expr": "internal_employee",
+          "agg_params": null,
+          "metadata": null,
+          "non_additive_dimension": null,
+          "agg_time_dimension": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        },
+        {
+          "name": "externals",
+          "agg": "sum",
+          "description": "Cantidad total de colaboradores externos",
+          "create_metric": false,
+          "expr": "outsourcing_employee",
+          "agg_params": null,
+          "metadata": null,
+          "non_additive_dimension": null,
+          "agg_time_dimension": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        },
+        {
+          "name": "vacancies",
+          "agg": "sum",
+          "description": "Cantidad total de vacantes",
+          "create_metric": false,
+          "expr": "vacancy",
+          "agg_params": null,
+          "metadata": null,
+          "non_additive_dimension": null,
+          "agg_time_dimension": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        },
+        {
+          "name": "suppliers",
+          "agg": "count_distinct",
+          "description": "Cantidad de proveedores distintos",
+          "create_metric": false,
+          "expr": "supplier_id",
+          "agg_params": null,
+          "metadata": null,
+          "non_additive_dimension": null,
+          "agg_time_dimension": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        }
+      ],
+      "dimensions": [
+        {
+          "name": "process_date",
+          "description": null,
+          "type": "time",
+          "datatype": null,
+          "is_partition": false,
+          "type_params": {
+            "time_granularity": "day",
+            "validity_params": null
+          },
+          "expr": null,
+          "metadata": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        },
+        {
+          "name": "position",
+          "description": null,
+          "type": "categorical",
+          "datatype": null,
+          "is_partition": false,
+          "type_params": null,
+          "expr": null,
+          "metadata": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        },
+        {
+          "name": "gender",
+          "description": null,
+          "type": "categorical",
+          "datatype": null,
+          "is_partition": false,
+          "type_params": null,
+          "expr": null,
+          "metadata": null,
+          "label": null,
+          "config": {
+            "meta": {}
+          }
+        }
+      ],
+      "label": null,
+      "metadata": null,
+      "config": {
+        "meta": {}
+      }
+    }
+  ],
+  "metrics": [
+    {
+      "name": "dotacion_total",
+      "description": "Cantidad total de colaboradores vigentes",
+      "type": "simple",
+      "datatype": null,
+      "type_params": {
+        "measure": {
+          "name": "employees",
+          "filter": null,
+          "alias": null,
+          "join_to_timespine": false,
+          "fill_nulls_with": null
+        },
+        "numerator": null,
+        "denominator": null,
+        "expr": null,
+        "window": null,
+        "grain_to_date": null,
+        "metrics": [],
+        "conversion_type_params": null,
+        "cumulative_type_params": null,
+        "input_measures": [
+          {
+            "name": "employees",
+            "filter": null,
+            "alias": null,
+            "join_to_timespine": false,
+            "fill_nulls_with": null
+          }
+        ],
+        "metric_aggregation_params": null,
+        "join_to_timespine": false,
+        "fill_nulls_with": null,
+        "is_private": null
+      },
+      "filter": null,
+      "metadata": null,
+      "label": "Dotación Total",
+      "config": {
+        "meta": {}
+      },
+      "time_granularity": null
+    },
+    {
+      "name": "dotacion_internos",
+      "description": "Cantidad total de colaboradores internos",
+      "type": "simple",
+      "datatype": null,
+      "type_params": {
+        "measure": {
+          "name": "internals",
+          "filter": null,
+          "alias": null,
+          "join_to_timespine": false,
+          "fill_nulls_with": null
+        },
+        "numerator": null,
+        "denominator": null,
+        "expr": null,
+        "window": null,
+        "grain_to_date": null,
+        "metrics": [],
+        "conversion_type_params": null,
+        "cumulative_type_params": null,
+        "input_measures": [
+          {
+            "name": "internals",
+            "filter": null,
+            "alias": null,
+            "join_to_timespine": false,
+            "fill_nulls_with": null
+          }
+        ],
+        "metric_aggregation_params": null,
+        "join_to_timespine": false,
+        "fill_nulls_with": null,
+        "is_private": null
+      },
+      "filter": null,
+      "metadata": null,
+      "label": "Dotación Internos",
+      "config": {
+        "meta": {}
+      },
+      "time_granularity": null
+    },
+    {
+      "name": "dotacion_externos",
+      "description": "Cantidad total de colaboradores externos",
+      "type": "simple",
+      "datatype": null,
+      "type_params": {
+        "measure": {
+          "name": "externals",
+          "filter": null,
+          "alias": null,
+          "join_to_timespine": false,
+          "fill_nulls_with": null
+        },
+        "numerator": null,
+        "denominator": null,
+        "expr": null,
+        "window": null,
+        "grain_to_date": null,
+        "metrics": [],
+        "conversion_type_params": null,
+        "cumulative_type_params": null,
+        "input_measures": [
+          {
+            "name": "externals",
+            "filter": null,
+            "alias": null,
+            "join_to_timespine": false,
+            "fill_nulls_with": null
+          }
+        ],
+        "metric_aggregation_params": null,
+        "join_to_timespine": false,
+        "fill_nulls_with": null,
+        "is_private": null
+      },
+      "filter": null,
+      "metadata": null,
+      "label": "Dotación Externos",
+      "config": {
+        "meta": {}
+      },
+      "time_granularity": null
+    },
+    {
+      "name": "dotacion_vacantes",
+      "description": "Cantidad de vacantes vigentes",
+      "type": "simple",
+      "datatype": null,
+      "type_params": {
+        "measure": {
+          "name": "vacancies",
+          "filter": null,
+          "alias": null,
+          "join_to_timespine": false,
+          "fill_nulls_with": null
+        },
+        "numerator": null,
+        "denominator": null,
+        "expr": null,
+        "window": null,
+        "grain_to_date": null,
+        "metrics": [],
+        "conversion_type_params": null,
+        "cumulative_type_params": null,
+        "input_measures": [
+          {
+            "name": "vacancies",
+            "filter": null,
+            "alias": null,
+            "join_to_timespine": false,
+            "fill_nulls_with": null
+          }
+        ],
+        "metric_aggregation_params": null,
+        "join_to_timespine": false,
+        "fill_nulls_with": null,
+        "is_private": null
+      },
+      "filter": null,
+      "metadata": null,
+      "label": "Vacantes",
+      "config": {
+        "meta": {}
+      },
+      "time_granularity": null
+    },
+    {
+      "name": "proveedores_distintos",
+      "description": "Cantidad de proveedores distintos",
+      "type": "simple",
+      "datatype": null,
+      "type_params": {
+        "measure": {
+          "name": "suppliers",
+          "filter": null,
+          "alias": null,
+          "join_to_timespine": false,
+          "fill_nulls_with": null
+        },
+        "numerator": null,
+        "denominator": null,
+        "expr": null,
+        "window": null,
+        "grain_to_date": null,
+        "metrics": [],
+        "conversion_type_params": null,
+        "cumulative_type_params": null,
+        "input_measures": [
+          {
+            "name": "suppliers",
+            "filter": null,
+            "alias": null,
+            "join_to_timespine": false,
+            "fill_nulls_with": null
+          }
+        ],
+        "metric_aggregation_params": null,
+        "join_to_timespine": false,
+        "fill_nulls_with": null,
+        "is_private": null
+      },
+      "filter": null,
+      "metadata": null,
+      "label": "Proveedores Distintos",
+      "config": {
+        "meta": {}
+      },
+      "time_granularity": null
+    },
+    {
+      "name": "ratio_internos",
+      "description": "Participación de colaboradores internos sobre la dotación total",
+      "type": "ratio",
+      "datatype": null,
+      "type_params": {
+        "measure": null,
+        "numerator": {
+          "name": "dotacion_internos",
+          "filter": null,
+          "alias": null,
+          "offset_window": null,
+          "offset_to_grain": null
+        },
+        "denominator": {
+          "name": "dotacion_total",
+          "filter": null,
+          "alias": null,
+          "offset_window": null,
+          "offset_to_grain": null
+        },
+        "expr": null,
+        "window": null,
+        "grain_to_date": null,
+        "metrics": [],
+        "conversion_type_params": null,
+        "cumulative_type_params": null,
+        "input_measures": [
+          {
+            "name": "internals",
+            "filter": null,
+            "alias": null,
+            "join_to_timespine": false,
+            "fill_nulls_with": null
+          },
+          {
+            "name": "employees",
+            "filter": null,
+            "alias": null,
+            "join_to_timespine": false,
+            "fill_nulls_with": null
+          }
+        ],
+        "metric_aggregation_params": null,
+        "join_to_timespine": false,
+        "fill_nulls_with": null,
+        "is_private": null
+      },
+      "filter": null,
+      "metadata": null,
+      "label": "Ratio Internos",
+      "config": {
+        "meta": {}
+      },
+      "time_granularity": null
+    },
+    {
+      "name": "ratio_externos",
+      "description": "Participación de colaboradores externos sobre la dotación total",
+      "type": "ratio",
+      "datatype": null,
+      "type_params": {
+        "measure": null,
+        "numerator": {
+          "name": "dotacion_externos",
+          "filter": null,
+          "alias": null,
+          "offset_window": null,
+          "offset_to_grain": null
+        },
+        "denominator": {
+          "name": "dotacion_total",
+          "filter": null,
+          "alias": null,
+          "offset_window": null,
+          "offset_to_grain": null
+        },
+        "expr": null,
+        "window": null,
+        "grain_to_date": null,
+        "metrics": [],
+        "conversion_type_params": null,
+        "cumulative_type_params": null,
+        "input_measures": [
+          {
+            "name": "externals",
+            "filter": null,
+            "alias": null,
+            "join_to_timespine": false,
+            "fill_nulls_with": null
+          },
+          {
+            "name": "employees",
+            "filter": null,
+            "alias": null,
+            "join_to_timespine": false,
+            "fill_nulls_with": null
+          }
+        ],
+        "metric_aggregation_params": null,
+        "join_to_timespine": false,
+        "fill_nulls_with": null,
+        "is_private": null
+      },
+      "filter": null,
+      "metadata": null,
+      "label": "Ratio Externos",
+      "config": {
+        "meta": {}
+      },
+      "time_granularity": null
+    }
+  ],
+  "project_configuration": {
+    "time_spine_table_configurations": [],
+    "metadata": null,
+    "dsi_package_version": {
+      "major_version": "0",
+      "minor_version": "213",
+      "patch_version": "0"
+    },
+    "time_spines": [
+      {
+        "node_relation": {
+          "alias": "metricflow_time_spine",
+          "schema_name": "dlk_slv_it_people_odm",
+          "database": "dlk_slv_it_people_odm",
+          "relation_name": "dlk_slv_it_people_odm.metricflow_time_spine"
+        },
+        "primary_column": {
+          "name": "date_day",
+          "time_granularity": "day"
+        },
+        "custom_granularities": []
+      }
+    ]
+  },
+  "saved_queries": []
+}

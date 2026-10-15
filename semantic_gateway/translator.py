@@ -1,0 +1,222 @@
+"""Traductor SQL (dialecto PostgreSQL) → `SemanticQuery`.
+
+Hay una tabla virtual por modelo semántico; sus columnas son las métricas del modelo y las dimensiones que se pueden
+cruzar con todas ellas. Una consulta lee una sola de esas tablas. Reglas:
+* Columna de métrica (sola o envuelta en SUM/MAX/MIN/AVG/MEASURE/AGG) → `metrics`. La agregación la decide
+  MetricFlow: el envoltorio se ignora, así un ratio nunca se suma.
+* Columna de dimensión → `group_by` (GROUP BY es implícito).
+* WHERE sobre `metric_time*` con >=, <=, = o BETWEEN y una fecha literal → restricción de tiempo (start/end) y no
+  filtro, para que las métricas con offset_window (año anterior) lean sus insumos antes de filtrar.
+* Resto del WHERE → filtros MetricFlow, con cada columna reescrita como {{ Dimension('…') }}.
+* ORDER BY (por nombre, alias u ordinal) y LIMIT se traspasan. Joins, subconsultas, HAVING y OFFSET se rechazan.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import re
+from typing import Optional
+
+import sqlglot
+import sqlglot.expressions as exp
+
+from .model import METRIC_TIME, Catalog, SemanticQuery, is_metric_time
+
+EXPLAIN_RE = re.compile(r"^\s*explain\s+(.*)$", re.IGNORECASE | re.DOTALL)
+AGGREGATES = (exp.Sum, exp.Max, exp.Min, exp.Avg)
+MEASURE_FUNCTIONS = {"MEASURE", "AGG"}
+
+
+class TranslationError(Exception):
+    pass
+
+
+def split_explain(sql: str) -> tuple[bool, str]:
+    match = EXPLAIN_RE.match(sql)
+    return (True, match.group(1)) if match else (False, sql)
+
+
+class Translator:
+    def __init__(self, catalog: Catalog, read: str = "postgres", warehouse_dialect: str = "duckdb") -> None:
+        self.catalog = catalog
+        self.read = read
+        self.warehouse_dialect = warehouse_dialect
+
+    # ------------------------------------------------------------------ enrutamiento
+    def is_semantic(self, sql: str) -> bool:
+        """True si la consulta lee una tabla virtual (va al motor); si no, la responde el catálogo."""
+        _, body = split_explain(sql)
+        try:
+            tree = sqlglot.parse_one(body, read=self.read)
+        except sqlglot.errors.ParseError:
+            return False
+        return tree is not None and any(t.name.lower() in self.catalog.tables for t in tree.find_all(exp.Table))
+
+    # ------------------------------------------------------------------ traducción
+    def translate(self, sql: str, dialect: Optional[str] = None) -> SemanticQuery:
+        """`dialect`: dialecto sqlglot con que se escriben los filtros del WHERE (por defecto el del constructor)."""
+        dialect = dialect or self.warehouse_dialect
+        try:
+            tree = sqlglot.parse_one(sql, read=self.read)
+        except sqlglot.errors.ParseError as e:
+            raise TranslationError(f"SQL no válido: {e}") from e
+        if not isinstance(tree, exp.Select):
+            raise TranslationError("Solo se admiten consultas SELECT sobre la tabla semántica")
+        table = self._check_shape(tree)
+
+        sq = SemanticQuery()
+        aliases: dict[str, str] = {}
+        for projection in tree.expressions:
+            if projection.is_star:
+                raise TranslationError("SELECT * no está soportado: elija métricas y dimensiones")
+            name, aggregated = self._column(projection.unalias())
+            published = projection.alias if isinstance(projection, exp.Alias) else name
+            if self.catalog.is_metric(name, table):
+                if name not in sq.metrics:
+                    sq.metrics.append(name)
+            elif self.catalog.is_dimension(name, table):
+                if aggregated:
+                    raise TranslationError(f"La dimensión '{name}' no se puede agregar")
+                if name not in sq.group_by:
+                    sq.group_by.append(name)
+            else:
+                raise self._unknown_column(name, table)
+            sq.output.append((name, published))
+            aliases[published.lower()] = name
+
+        where = tree.args.get("where")
+        if where is not None:
+            for condition in self._conjuncts(where.this):
+                self._where(condition, sq, dialect, table)
+
+        order = tree.args.get("order")
+        if order is not None:
+            for ordered in order.expressions:
+                name = self._order_name(ordered.this, sq, aliases)
+                sq.order_by.append(("-" if ordered.args.get("desc") else "") + name)
+
+        limit = tree.args.get("limit")
+        if limit is not None:
+            value = limit.args.get("expression")
+            if not isinstance(value, exp.Literal) or value.is_string:
+                raise TranslationError("LIMIT debe ser un entero")
+            sq.limit = int(value.this)
+        return sq
+
+    # ------------------------------------------------------------------ piezas
+    def _check_shape(self, tree: exp.Select) -> str:
+        """Valida la forma de la consulta y devuelve el nombre de la tabla virtual que lee."""
+        tables = list(tree.find_all(exp.Table))
+        if len(tables) != 1 or tables[0].name.lower() not in self.catalog.tables:
+            raise TranslationError(
+                f"La consulta debe leer una sola tabla semántica: {', '.join(sorted(self.catalog.tables))}")
+        for arg, label in (("joins", "JOIN"), ("having", "HAVING"), ("offset", "OFFSET"), ("with", "WITH")):
+            if tree.args.get(arg):
+                raise TranslationError(f"{label} no está soportado en la capa semántica")
+        if tree.find(exp.Subquery):
+            raise TranslationError("Las subconsultas no están soportadas en la capa semántica")
+        return tables[0].name.lower()
+
+    def _unknown_column(self, name: str, table: str) -> TranslationError:
+        """Error claro: la columna no existe, o existe pero en otra tabla semántica."""
+        others = [t for t in self.catalog.tables_with(name) if t != table]
+        if others:
+            return TranslationError(
+                f"La columna '{name}' no está en la tabla '{table}'; está en: {', '.join(others)}. "
+                f"Una consulta solo puede combinar columnas de una misma tabla")
+        return TranslationError(f"Columna desconocida en la capa semántica: '{name}'")
+
+    @staticmethod
+    def _column(node: exp.Expression) -> tuple[str, bool]:
+        aggregated = False
+        if isinstance(node, AGGREGATES):
+            node, aggregated = node.this, True
+        elif isinstance(node, exp.Anonymous) and node.name.upper() in MEASURE_FUNCTIONS and len(node.expressions) == 1:
+            node, aggregated = node.expressions[0], True
+        if not isinstance(node, exp.Column):
+            raise TranslationError(f"Expresión no soportada: {node.sql()} (use columnas de la tabla semántica)")
+        return node.name.lower(), aggregated
+
+    @staticmethod
+    def _conjuncts(node: exp.Expression) -> list[exp.Expression]:
+        node = node.unnest()
+        if isinstance(node, exp.And):
+            return [c for part in node.flatten() for c in Translator._conjuncts(part)]
+        return [node]
+
+    def _where(self, condition: exp.Expression, sq: SemanticQuery, dialect: str, table: str) -> None:
+        columns = [c.name.lower() for c in condition.find_all(exp.Column)]
+        if not columns:
+            raise TranslationError(f"Filtro sin columnas: {condition.sql()}")
+        for name in columns:
+            if self.catalog.is_metric(name, table):
+                raise TranslationError(f"No se puede filtrar por la métrica '{name}' (HAVING no está soportado)")
+            if not self.catalog.is_dimension(name, table):
+                raise self._unknown_column(name, table)
+        if all(is_metric_time(c) for c in columns) and self._time_constraint(condition, sq):
+            return
+        sq.where.append(self._metricflow_filter(condition, dialect))
+
+    @staticmethod
+    def _time_constraint(condition: exp.Expression, sq: SemanticQuery) -> bool:
+        start: Optional[dt.date] = None
+        end: Optional[dt.date] = None
+        if isinstance(condition, exp.Between) and isinstance(condition.this, exp.Column):
+            start, end = _date(condition.args.get("low")), _date(condition.args.get("high"))
+            if start is None or end is None:
+                return False
+        elif isinstance(condition, (exp.GTE, exp.LTE, exp.EQ)):
+            left, right = condition.this, condition.expression
+            op = type(condition)
+            if isinstance(right, exp.Column):  # literal op columna → columna op' literal
+                left, right = right, left
+                op = {exp.GTE: exp.LTE, exp.LTE: exp.GTE}.get(op, op)
+            value = _date(right)
+            if not isinstance(left, exp.Column) or value is None:
+                return False
+            start = value if op in (exp.GTE, exp.EQ) else None
+            end = value if op in (exp.LTE, exp.EQ) else None
+        else:
+            return False
+        if start is not None:
+            sq.start = max(sq.start, start) if sq.start else start
+        if end is not None:
+            sq.end = min(sq.end, end) if sq.end else end
+        return True
+
+    def _metricflow_filter(self, condition: exp.Expression, dialect: str) -> str:
+        def to_jinja(node: exp.Expression) -> exp.Expression:
+            if not isinstance(node, exp.Column):
+                return node
+            name = node.name.lower()
+            if is_metric_time(name):
+                grain = name.split("__", 1)[1] if "__" in name else "day"
+                return exp.Var(this=f"{{{{ TimeDimension('{METRIC_TIME}', '{grain}') }}}}")
+            if self.catalog.dimensions[name].kind == "time":
+                return exp.Var(this=f"{{{{ TimeDimension('{name}') }}}}")
+            return exp.Var(this=f"{{{{ Dimension('{name}') }}}}")
+
+        return condition.transform(to_jinja).sql(dialect=dialect)
+
+    def _order_name(self, node: exp.Expression, sq: SemanticQuery, aliases: dict[str, str]) -> str:
+        if isinstance(node, exp.Literal) and not node.is_string:
+            index = int(node.this) - 1
+            if not 0 <= index < len(sq.output):
+                raise TranslationError(f"ORDER BY {node.this} fuera de rango")
+            return sq.output[index][0]
+        name, _ = self._column(node)
+        name = aliases.get(name, name)
+        if name not in sq.metrics and name not in sq.group_by:
+            raise TranslationError(f"ORDER BY '{name}': la columna debe estar en el SELECT")
+        return name
+
+
+def _date(node: Optional[exp.Expression]) -> Optional[dt.date]:
+    if isinstance(node, exp.Cast):
+        node = node.this
+    if isinstance(node, exp.Literal) and node.is_string:
+        try:
+            return dt.date.fromisoformat(node.this[:10])
+        except ValueError:
+            return None
+    return None

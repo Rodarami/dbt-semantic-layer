@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: lab_data_bronze
+    tables:
+      - name: events
+      - name: items
+  - name: silver
+    schema: lab_data_silver
+    tables:
+      - name: silver_event
+      - name: silver_item

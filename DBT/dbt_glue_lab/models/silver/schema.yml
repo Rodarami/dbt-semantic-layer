@@ -1,0 +1,191 @@
+version: 2
+
+# Capa semántica (dbt latest spec, dbt >= 1.12 / MetricFlow)
+# Docs: https://docs.getdbt.com/docs/build/semantic-models
+
+models:
+  # ---------------------------------------------------------------------------
+  # silver_event  ·  grano: 1 fila por evento (event_id)
+  # ---------------------------------------------------------------------------
+  - name: silver_event
+    description: "Eventos de la aplicación (vistas de items, vistas de perfil, asignaciones de test) parseados desde el payload JSON de bronze.events."
+
+    semantic_model:
+      enabled: true
+      name: events
+
+    agg_time_dimension: event_date
+
+    columns:
+      - name: event_id
+        description: "Identificador único del evento."
+        data_type: string
+        entity:
+          type: primary
+          name: event
+
+      - name: user_id
+        description: "Identificador del usuario que genera el evento."
+        data_type: bigint
+        entity:
+          type: foreign
+          name: user
+
+      - name: event_date
+        description: "Fecha del evento (partición de la tabla)."
+        data_type: date
+        granularity: day
+        dimension:
+          type: time
+
+      - name: event_name
+        description: "Nombre del evento: view_item, view_user_profile, test_assignment."
+        data_type: string
+        dimension:
+          type: categorical
+
+      - name: platform
+        description: "Plataforma de origen: web, mobile web, android, iOS, server."
+        data_type: string
+        dimension:
+          type: categorical
+
+      - name: parameter_name
+        description: "Nombre del parámetro del evento (item_id, referrer, test_id, test_assignment, viewed_user_id)."
+        data_type: string
+        dimension:
+          type: categorical
+
+      - name: event_year
+        description: "Año del evento."
+        data_type: int
+        dimension:
+          type: categorical
+
+      # Columnas sin rol semántico (sólo documentación)
+      - name: event_at_ts
+        description: "Fecha y hora del evento como texto 'yyyy-MM-dd HH:mm:ss'."
+        data_type: string
+      - name: parameter_value
+        description: "Valor del parámetro del evento (texto; para view_item corresponde al item_id)."
+        data_type: string
+
+    metrics:
+      - name: event_count
+        label: Eventos
+        description: "Cantidad total de eventos."
+        type: simple
+        agg: count_distinct
+        expr: event_id
+
+      - name: unique_users
+        label: Usuarios únicos
+        description: "Cantidad de usuarios distintos que generaron eventos."
+        type: simple
+        agg: count_distinct
+        expr: user_id
+
+      - name: item_views
+        label: Vistas de items
+        description: "Cantidad de eventos view_item."
+        type: simple
+        agg: count_distinct
+        expr: event_id
+        filter: |
+          {{ Dimension('event__event_name') }} = 'view_item'
+
+      - name: profile_views
+        label: Vistas de perfil
+        description: "Cantidad de eventos view_user_profile."
+        type: simple
+        agg: count_distinct
+        expr: event_id
+        filter: |
+          {{ Dimension('event__event_name') }} = 'view_user_profile'
+
+  # ---------------------------------------------------------------------------
+  # silver_item  ·  grano: 1 fila por item (item_id)
+  # ---------------------------------------------------------------------------
+  - name: silver_item
+    description: "Catálogo de items con categoría, atributos descriptivos y precio."
+
+    semantic_model:
+      enabled: true
+      name: items
+
+    agg_time_dimension: created_at_date
+
+    columns:
+      - name: item_id
+        description: "Identificador único del item."
+        data_type: bigint
+        entity:
+          type: primary
+          name: item
+
+      - name: created_at_date
+        description: "Fecha de creación del item (partición de la tabla)."
+        data_type: date
+        granularity: day
+        dimension:
+          type: time
+
+      - name: item_name
+        description: "Nombre del item."
+        data_type: string
+        dimension:
+          type: categorical
+
+      - name: category
+        description: "Categoría del item (instrument, gadget, module, mechanism, tool, device, widget, dongle, apparatus, contraption)."
+        data_type: string
+        dimension:
+          type: categorical
+
+      - name: adjective
+        description: "Adjetivo descriptivo del item ('unknown' si no tiene)."
+        data_type: string
+        dimension:
+          type: categorical
+
+      - name: modifier
+        description: "Modificador/accesorio del item ('unknown' si no tiene)."
+        data_type: string
+        dimension:
+          type: categorical
+
+      - name: price
+        description: "Precio del item."
+        data_type: decimal(10,2)
+      - name: created_at_ts
+        description: "Fecha y hora de creación como texto 'yyyy-MM-dd HH:mm:ss'."
+        data_type: string
+
+    metrics:
+      - name: item_count
+        label: Items
+        description: "Cantidad de items en el catálogo."
+        type: simple
+        agg: count_distinct
+        expr: item_id
+
+      - name: total_item_price
+        label: Suma de precios
+        description: "Suma de los precios de los items."
+        type: simple
+        agg: sum
+        expr: price
+
+      - name: avg_item_price
+        label: Precio promedio
+        description: "Precio promedio de los items."
+        type: simple
+        agg: average
+        expr: price
+
+      - name: max_item_price
+        label: Precio máximo
+        description: "Precio máximo de los items."
+        type: simple
+        agg: max
+        expr: price

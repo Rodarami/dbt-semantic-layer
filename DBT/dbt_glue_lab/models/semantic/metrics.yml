@@ -1,0 +1,27 @@
+version: 2
+
+# Métricas que combinan semantic models (ratio / derived / etc.)
+# Las métricas simple viven dentro de cada modelo (ver silver/schema.yml).
+metrics:
+  - name: item_views_per_user
+    label: Vistas de items por usuario
+    description: "Vistas de items divididas por usuarios únicos."
+    type: ratio
+    numerator: item_views
+    denominator: unique_users
+
+  - name: item_views_share
+    label: "Porcentaje de eventos que son vistas de items"
+    description: "Proporción de eventos que corresponden a view_item."
+    type: ratio
+    numerator: item_views
+    denominator: event_count
+
+  - name: engagement_events
+    label: Vistas de items + perfiles
+    description: "Suma de vistas de items y de perfiles."
+    type: derived
+    expr: item_views + profile_views
+    input_metrics:
+      - name: item_views
+      - name: profile_views

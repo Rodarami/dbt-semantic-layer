@@ -1,0 +1,7 @@
+# Dependencias del gateway semántico (se suman a las de dbt/MetricFlow del README, sección 3)
+metricflow==0.213.0
+buenavista==0.5.0       # servidor Postgres wire (Python puro)
+sqlglot>=30             # traductor SQL -> consulta semántica
+pyarrow
+duckdb                  # catálogo en memoria que ven los clientes (information_schema, pg_catalog)
+psycopg[binary]>=3.2    # solo para test_gateway.py

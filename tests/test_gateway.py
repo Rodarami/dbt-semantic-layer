@@ -1,0 +1,192 @@
+"""Prueba de integración por protocolo Postgres: un solo servidor, el motor se elige en la conexión (dbname).
+
+Uso (desde la raíz del proyecto dbt):  python -m tests.test_gateway [ruta/semantic_manifest.json]
+"""
+
+from __future__ import annotations
+
+import re
+import socket
+import sys
+
+import psycopg
+
+from semantic_gateway.server import start_in_thread
+
+QUERY = ("SELECT event__platform, MEASURE(item_views) AS vistas FROM semantic.events "
+         "WHERE event__platform IN ('ios','android') AND metric_time >= DATE '2024-01-01' GROUP BY 1 ORDER BY 1")
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _connect(port: int, dbname: str):
+    return psycopg.connect(f"host=127.0.0.1 port={port} user=bi password=bi dbname={dbname}", autocommit=True)
+
+
+def _norm(sql: str) -> str:
+    """MetricFlow numera los alias internos (subq_3, subq_4…) con un contador global: se normalizan para comparar."""
+    return re.sub(r"_\d+\b", "_N", sql)
+
+
+def _sql(port: int, dbname: str) -> str:
+    with _connect(port, dbname) as c:
+        return _norm(c.execute(QUERY).fetchone()[0])
+
+
+def main(manifest: str) -> None:
+    port = _free_port()
+    server = start_in_thread("127.0.0.1", port, "bi", "bi", manifest, "athena")  # motor por defecto: athena
+    try:
+        athena, snowflake = _sql(port, "athena"), _sql(port, "snowflake")
+        assert "timestamp '2024-01-01'" in athena, athena             # dialecto Athena
+        assert "BETWEEN '2024-01-01'" in snowflake and "timestamp" not in snowflake.split("WHERE")[1], snowflake
+        assert athena != snowflake
+        assert _sql(port, "semantic") == athena                       # dbname=semantic → motor por defecto
+        assert _sql(port, "BI") == athena                             # dbname = usuario (default de psql) → por defecto
+        print("OK · dbname=athena / snowflake / semantic")
+
+        # dos conexiones simultáneas con motores distintos no se mezclan
+        with _connect(port, "snowflake") as c1, _connect(port, "athena") as c2:
+            a, b = _norm(c1.execute(QUERY).fetchone()[0]), _norm(c2.execute(QUERY).fetchone()[0])
+            assert a == snowflake and b == athena
+        print("OK · conexiones simultáneas independientes")
+
+        # el motor también aplica a EXPLAIN y a los filtros del WHERE
+        with _connect(port, "snowflake") as c:
+            out = _norm(c.execute("EXPLAIN " + QUERY).fetchone()[0])
+            assert out == snowflake, out
+
+        # dbname desconocido: conecta y los metadatos funcionan, pero la consulta semántica falla con un mensaje claro
+        with _connect(port, "oracle") as c:
+            assert c.execute("SELECT count(*) FROM semantic.metrics").fetchone()[0] >= 10
+            try:
+                c.execute(QUERY)
+            except psycopg.Error as e:
+                assert "no existe" in str(e) and "snowflake" in str(e), e
+            else:
+                raise AssertionError("dbname desconocido debía fallar")
+        print("OK · dbname desconocido")
+
+        # compatibilidad con drivers JDBC (Metabase): ping ';', SHOW, parámetros de texto y protocolo extendido
+        for prepare in (None, 0):
+            with psycopg.connect(f"host=127.0.0.1 port={port} user=bi password=bi dbname=athena",
+                                 autocommit=True, prepare_threshold=prepare) as c:
+                c.execute(";")
+                c.execute("")
+                assert c.execute("SHOW TRANSACTION ISOLATION LEVEL").fetchone()[0] == "read committed"
+                assert c.execute("SELECT %s::text", ("a",)).fetchone()[0] == "a"
+                assert c.execute("SELECT count(*) FROM information_schema.tables WHERE table_schema = %s",
+                                 ("semantic",)).fetchone()[0] == 5
+                assert c.execute("SELECT 1").fetchone()[0] == 1  # la conexión sigue viva tras todo lo anterior
+        print("OK · compatibilidad JDBC (ping, SHOW, parámetros)")
+
+        # sincronización de Metabase: lista de tablas (regnamespace + has_*_privilege) y columnas con tipos PG
+        with _connect(port, "athena") as c:
+            tablas = c.execute(
+                "SELECT c.relnamespace::regnamespace::text AS schema, c.relname AS name FROM pg_catalog.pg_class AS c "
+                "WHERE c.relnamespace::regnamespace::text = 'semantic' AND c.relkind IN ('r','p','v','f','m') "
+                "AND (pg_catalog.has_schema_privilege(c.relnamespace, 'USAGE') AND "
+                "(pg_catalog.has_table_privilege(c.oid, 'SELECT') OR pg_catalog.has_any_column_privilege(c.oid, 'SELECT')))"
+            ).fetchall()
+            assert {t[1] for t in tablas} == {"events", "items", "metrics", "dimensions", "metric_dimensions"}, tablas
+            cols = c.execute(
+                "SELECT a.attname, t.typname FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class k ON a.attrelid = k.oid "
+                "JOIN pg_catalog.pg_type t ON a.atttypid = t.oid WHERE k.relname = 'events' AND a.attnum > 0 "
+                "AND NOT a.attisdropped").fetchall()
+            assert len(cols) == 18 and dict(cols)["event_count"] == "float8" and dict(cols)["metric_time"] == "date", cols
+            assert c.execute("show timezone").fetchone()[0] == "UTC"
+            assert c.execute("select schemaname FROM pg_catalog.pg_matviews").fetchall() == []
+            assert c.execute("SELECT NULL AS a, 1 AS b").fetchone() == (None, 1)
+            filas = c.execute(
+                "SELECT n.nspname, c.relname, stat.n_live_tup FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_class c "
+                "ON c.relnamespace = n.oid LEFT JOIN pg_stat_user_tables stat ON (n.nspname = stat.schemaname "
+                "AND c.relname = stat.relname) WHERE n.nspname = 'semantic'").fetchall()
+            assert len(filas) == 5, filas
+            # consulta que sqlglot no puede analizar (palabras reservadas sin comillas): respaldo textual
+            n = c.execute("select t.schemaname as schema, t.objectname as table, "
+                          "pg_catalog.has_table_privilege(current_user, t.objectname, 'SELECT') as select "
+                          "from (select schemaname, matviewname as objectname from pg_catalog.pg_matviews "
+                          "union all select schemaname, tablename from pg_catalog.pg_tables) t "
+                          "where pg_catalog.has_schema_privilege(current_user, t.schemaname, 'USAGE')").fetchall()
+            assert len(n) >= 5, n
+            # sondas de Metabase sobre la tabla semántica: no devuelven filas y no pasan por MetricFlow
+            assert c.execute('SELECT TRUE AS "_" FROM "semantic"."events" WHERE 1 <> 1 LIMIT 0').fetchall() == []
+            assert c.execute("SELECT * FROM semantic.items LIMIT 0").description is not None
+            # transacción de solo lectura y claves primarias de JDBC
+            c.execute("BEGIN READ ONLY")
+            c.execute("COMMIT")
+            pk = c.execute("SELECT ct.relname AS TABLE_NAME, (information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ "
+                           "FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ct ON i.indrelid = ct.oid")
+            assert pk.fetchall() == []
+        # parámetros sin tipo con protocolo extendido (como JDBC): no se interpretan como fecha
+        with psycopg.connect(f"host=127.0.0.1 port={port} user=bi password=bi dbname=athena", autocommit=True,
+                             prepare_threshold=0) as c:
+            r = c.execute("SELECT count(*) FROM information_schema.tables WHERE table_schema = %s "
+                          "AND table_name !~ %s", ("semantic", "^pg_")).fetchone()[0]
+            assert r == 5, r
+            # parámetros sin tipo en contextos numéricos (LIMIT, oid) y claves primarias de JDBC con 2 parámetros
+            assert len(c.execute("SELECT relname FROM pg_catalog.pg_class WHERE relname LIKE %s LIMIT %s",
+                                 ("%", 2)).fetchall()) == 2
+            assert c.execute("SELECT ct.relname, (information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ "
+                             "FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class ct ON i.indrelid = ct.oid "
+                             "WHERE ct.relname = %s AND ct.relnamespace = %s", ("metrics", "semantic")).fetchall() == []
+        print("OK · sincronización de metadatos tipo Metabase")
+
+        # una tabla por modelo semántico: cada una publica solo lo que se puede combinar
+        with _connect(port, "athena") as c:
+            def cols(t):
+                return {r[0] for r in c.execute("SELECT column_name FROM information_schema.columns "
+                                                "WHERE table_schema = 'semantic' AND table_name = %s", (t,)).fetchall()}
+            ev, it = cols("events"), cols("items")
+            assert {"event_count", "event__platform", "metric_time__month"} <= ev and not {"total_item_price", "item__category"} & ev
+            assert {"total_item_price", "item__category", "metric_time__month"} <= it and not {"event_count", "event__platform"} & it
+            assert dict(c.execute("SELECT metric, table_name FROM semantic.metrics").fetchall())["item_views_per_user"] == "events"
+            assert "COUNT(DISTINCT event_id)" in c.execute("SELECT event__platform, event_count FROM semantic.events").fetchone()[0]
+            assert "silver_item" in c.execute("SELECT item__category, total_item_price FROM semantic.items").fetchone()[0]
+            for sql, msg in [("SELECT item__category, event_count FROM semantic.events", "está en: items"),
+                             ("SELECT event__platform, total_item_price FROM semantic.items", "está en: events")]:
+                try:
+                    c.execute(sql)
+                except psycopg.Error as e:
+                    assert msg in str(e), e
+                else:
+                    raise AssertionError(f"debía fallar: {sql}")
+        print("OK · una tabla virtual por modelo semántico")
+
+        # navegación de DBeaver: tablas, columnas, índices, triggers, roles, extensiones, bases y tamaños
+        with psycopg.connect(f"host=127.0.0.1 port={port} user=bi password=bi dbname=athena", autocommit=True,
+                             prepare_threshold=0) as c:
+            ns = c.execute("SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'semantic'").fetchone()[0]
+            tbl = c.execute("SELECT oid FROM pg_catalog.pg_class WHERE relname = 'events'").fetchone()[0]
+            assert len(c.execute(
+                "SELECT c.oid, c.*, pg_catalog.pg_get_expr(c.relpartbound, c.oid) AS partition_expr, "
+                "pg_catalog.pg_get_partkeydef(c.oid) AS partition_key FROM pg_catalog.pg_class c "
+                "WHERE c.relnamespace = %s AND c.relkind NOT IN ('i','I','c')", (ns,)).fetchall()) == 5
+            assert len(c.execute(
+                "SELECT c.relname, a.*, pg_catalog.pg_get_expr(ad.adbin, ad.adrelid, true) AS def_value "
+                "FROM pg_catalog.pg_attribute a INNER JOIN pg_catalog.pg_class c ON a.attrelid = c.oid "
+                "LEFT OUTER JOIN pg_catalog.pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum "
+                "WHERE NOT a.attisdropped AND c.oid = %s ORDER BY a.attnum", (tbl,)).fetchall()) == 18
+            assert c.execute("SELECT pg_catalog.pg_relation_size(i.indexrelid), pg_catalog.pg_stat_get_numscans(i.indexrelid) "
+                             "FROM pg_catalog.pg_index i WHERE i.indrelid = %s", (tbl,)).fetchall() == []
+            for vista in ("pg_trigger", "pg_roles", "pg_extension"):
+                assert c.execute(f"SELECT * FROM pg_catalog.{vista}").fetchall() == []
+            assert c.execute("SELECT datname FROM pg_catalog.pg_database WHERE datname = %s", ("athena",)).fetchall() == [("athena",)]
+            assert c.execute("SELECT pg_tablespace_location(t.oid) FROM pg_catalog.pg_tablespace t").fetchall()
+            # arranque de DBeaver: search_path (reset_val) y palabras reservadas (pg_get_keywords + arreglo '{...}')
+            assert c.execute("SELECT reset_val FROM pg_settings WHERE name = 'search_path'").fetchall() == [("semantic, main",)]
+            palabras = c.execute("SELECT LISTAGG(word, ',') FROM pg_catalog.PG_GET_KEYWORDS() "
+                                 "WHERE word <> ALL(CAST('{abs,absolute}' AS TEXT[]))").fetchone()[0]
+            assert "select" in palabras.split(",") and "abs" not in palabras.split(",")
+        print("OK · navegación tipo DBeaver")
+    finally:
+        server.shutdown()
+    print("OK · gateway Postgres wire: motor por conexión")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else "semantic_manifests/dbt_glue_lab/semantic_manifest.json")

@@ -1,0 +1,11 @@
+# Perfil SOLO para MetricFlow (`mf` no soporta el adaptador `glue`).
+# Usa el mismo nombre de perfil que dbt_project.yml. No se conecta a AWS:
+# DuckDB sólo sirve para que mf pueda generar el SQL de las consultas.
+# Uso:  export DBT_PROFILES_DIR=$PWD/mf_profiles
+dbt_glue_lab:
+  target: mf
+  outputs:
+    mf:
+      type: duckdb
+      path: ":memory:"
+      schema: lab_data
