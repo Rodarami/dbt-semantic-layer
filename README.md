@@ -46,6 +46,7 @@ MetricFlow/                              # raíz del repositorio git
 | `semantic_gateway/`, `tests/`, `notebooks/` | [docs/gateway_semantico.md](docs/gateway_semantico.md) (instalación, uso y referencia) |
 | Cómo funciona el gateway por dentro y cobertura del ADR | [docs/arquitectura_gateway.md](docs/arquitectura_gateway.md) |
 | Consultas de ejemplo para DBeaver y Metabase (ambos manifests) | [docs/consultas.md](docs/consultas.md) |
+| Credenciales de AWS en Windows (PowerShell) para ejecutar en Athena | [docs/credenciales_aws_windows.md](docs/credenciales_aws_windows.md) |
 | `DBT/dbt_glue_lab/` | [DBT/dbt_glue_lab/README.md](DBT/dbt_glue_lab/README.md) (incluye el estado frente al ADR, sección 15) |
 | Consultas por manifest | [dbt_glue_lab](semantic_manifests/dbt_glue_lab/CONSULTAS.md) · [it-people](semantic_manifests/it-people/CONSULTAS.md) |
 
