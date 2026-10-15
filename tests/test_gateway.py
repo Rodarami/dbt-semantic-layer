@@ -186,6 +186,79 @@ def main(manifest: str) -> None:
     finally:
         server.shutdown()
     print("OK · gateway Postgres wire: motor por conexión")
+    probar_ejecucion(manifest)
+
+
+class _EjecutorFalso:
+    """Simula Athena: guarda el SQL recibido y devuelve filas fijas (MetricFlow pone dimensiones primero)."""
+    motor = "athena"
+
+    def __init__(self) -> None:
+        self.sql: list[str] = []
+
+    def ejecutar(self, sql: str):
+        import pyarrow as pa
+        from semantic_gateway.executor import Resultado
+        self.sql.append(sql)
+        tabla = pa.table({"event__platform": ["ios", "android"], "event_count": [10, 20]})
+        return Resultado(tabla=tabla, query_id="q-falsa", segundos=0.1, bytes_escaneados=2048)
+
+
+def probar_ejecucion(manifest: str) -> None:
+    """Con ejecutor: dbname=athena devuelve filas; EXPLAIN y otros motores siguen devolviendo el SQL."""
+    falso = _EjecutorFalso()
+    port = _free_port()
+    server = start_in_thread("127.0.0.1", port, "bi", "bi", manifest, "athena", {"athena": falso})
+    try:
+        with _connect(port, "athena") as c:
+            cur = c.execute("SELECT event_count AS eventos, event__platform FROM semantic.events")
+            assert [d.name for d in cur.description] == ["eventos", "event__platform"]  # orden y alias del cliente
+            assert cur.fetchall() == [(10, "ios"), (20, "android")]
+            assert len(falso.sql) == 1 and "event__platform" in falso.sql[0]           # recibió el SQL compilado
+            assert "SELECT" in c.execute("EXPLAIN SELECT event_count FROM semantic.events").fetchone()[0]
+            assert len(falso.sql) == 1                                                # EXPLAIN no ejecuta
+            assert c.execute("SELECT metric FROM semantic.metrics WHERE metric = 'event_count'").fetchall()
+            assert len(falso.sql) == 1                                                # el catálogo no va a Athena
+        with _connect(port, "snowflake") as c:                                       # sin ejecutor: devuelve el SQL
+            assert c.execute("SELECT event_count FROM semantic.events").description[0].name == "sql"
+        assert len(falso.sql) == 1
+    finally:
+        server.shutdown()
+    print("OK · ejecución: filas en dbname=athena, SQL en EXPLAIN y en motores sin ejecutor")
+
+    # tiempo máximo y límite de filas del ejecutor de Athena (sin AWS: se reemplaza el cursor)
+    import time
+    import pyarrow as pa
+    from semantic_gateway.executor import ConfigAthena, EjecutorAthena, ExecutionError
+
+    class _Cursor:
+        def __init__(self, demora): self.demora = demora; self.data_scanned_in_bytes = 1
+        def execute(self, sql, on_start_query_execution=None):
+            on_start_query_execution("q-1"); time.sleep(self.demora)
+        def as_arrow(self): return pa.table({"x": list(range(5))})
+
+    class _Conexion:
+        def __init__(self, demora): self.demora = demora; self.detenidas = []
+        def cursor(self): return _Cursor(self.demora)
+        @property
+        def client(self):
+            conexion = self
+            class _C:
+                def stop_query_execution(self, QueryExecutionId): conexion.detenidas.append(QueryExecutionId)
+            return _C()
+
+    ej = EjecutorAthena.__new__(EjecutorAthena)
+    ej.config, ej._conexion = ConfigAthena(max_filas=3, timeout=5), _Conexion(0)
+    r = ej.ejecutar("select 1")
+    assert r.tabla.num_rows == 3 and r.truncado and r.query_id == "q-1"
+    ej.config, ej._conexion = ConfigAthena(timeout=0.3), _Conexion(2)
+    try:
+        ej.ejecutar("select 1")
+    except ExecutionError as e:
+        assert "tiempo máximo" in str(e) and ej._conexion.detenidas == ["q-1"]
+    else:
+        raise AssertionError("debía vencer el tiempo")
+    print("OK · ejecutor Athena: --max-filas corta y --timeout cancela la consulta")
 
 
 if __name__ == "__main__":

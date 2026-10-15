@@ -8,6 +8,9 @@ salvo `dbt parse`, que se ejecuta dentro de cada proyecto dbt (`DBT/dbt_glue_lab
 
 Actualizado el 10 de octubre de 2026.
 
+> El recorrido detallado de una consulta por cada pieza, con diagramas, y la cobertura del ADR están en
+> [arquitectura_gateway.md](arquitectura_gateway.md).
+
 ## Índice
 
 1. [Qué es y qué hace hoy](#1-qué-es-y-qué-hace-hoy)
@@ -41,8 +44,8 @@ la capa semántica como si fueran columnas de una tabla.
 | | Estado actual |
 | --- | --- |
 | Qué publica | Una tabla virtual por modelo semántico: `semantic.events` y `semantic.items` |
-| Qué hace con una consulta semántica | La traduce, la **compila** con MetricFlow al dialecto pedido y devuelve el SQL resultante en una columna `sql` |
-| Qué no hace | No ejecuta nada contra ningún warehouse. No devuelve datos de negocio |
+| Qué hace con una consulta semántica | La traduce y la **compila** con MetricFlow al dialecto pedido. Sin `--ejecutar`, devuelve el SQL en una columna `sql`. Con `--ejecutar`, las conexiones `dbname=athena` reciben las **filas** de Athena y el SQL queda en el log (sección 10.6) |
+| Qué no hace | No ejecuta en motores distintos de Athena: para ellos devuelve el SQL |
 | Motores (dialectos) | athena, bigquery, databricks, duckdb, postgres, redshift, snowflake, trino |
 | Cómo se elige el motor | En cada conexión, con el nombre de la base de datos (`dbname=snowflake`) |
 | Fuente de verdad | Un `semantic_manifest.json` de `semantic_manifests/` (uno por proyecto dbt), generado por `dbt parse`. Se lee una vez al arrancar |
@@ -175,6 +178,7 @@ MetricFlow/                         # raíz del repositorio
 │   ├── model.py             # estructuras de datos (contrato común)
 │   ├── translator.py        # SQL del cliente → SemanticQuery (sqlglot)
 │   ├── engine.py            # MetricFlow como compilador; arma el catálogo
+│   ├── executor.py          # ejecuta en Athena el SQL compilado (opcional, --ejecutar)
 │   └── server.py            # servidor Postgres (buenavista), catálogo DuckDB, compatibilidad BI
 ├── tests/
 │   ├── test_translator.py   # pruebas del traductor, sin base de datos
@@ -198,7 +202,8 @@ MetricFlow/                         # raíz del repositorio
 | `model.py` | 81 | Estructuras de datos, sin lógica ni dependencias | `MetricInfo`, `DimensionInfo`, `TableInfo`, `Catalog`, `SemanticQuery`, `is_metric_time` |
 | `translator.py` | 222 | SQL (dialecto Postgres) → `SemanticQuery` | `Translator.is_semantic`, `translate`, `_check_shape`, `_unknown_column`, `_where`, `_time_constraint`, `_metricflow_filter`, `split_explain` |
 | `engine.py` | 174 | Carga el manifest, arma el catálogo y compila con MetricFlow sin conexión | `SemanticEngine.catalog`, `_tables`, `explain`, `ClienteSqlSoloDialecto`, `MOTORES`, `SQLGLOT_DIALECT` |
-| `server.py` | 447 | Servidor, catálogo en DuckDB, motor por conexión, enrutamiento, compatibilidad JDBC | `build_server`, `install_catalog`, `SemanticSession.execute_sql`, `SemanticRewriter`, `MotorHandler`, `motor_from_database`, `main` |
+| `executor.py` | 133 | Ejecuta en Athena el SQL compilado y devuelve una tabla Arrow; tiempo máximo y límite de filas | `EjecutorAthena`, `ConfigAthena`, `Resultado`, `ExecutionError`, `ordenar_columnas` |
+| `server.py` | 528 | Servidor, catálogo en DuckDB, motor por conexión, enrutamiento, compatibilidad JDBC, ejecución opcional | `build_server`, `install_catalog`, `SemanticSession.execute_sql`, `SemanticRewriter`, `MotorHandler`, `motor_from_database`, `main` |
 
 La lista completa de clases y funciones, con quién las llama y su capa del ADR, está en la
 [sección 19](#19-referencia-de-funciones).
@@ -442,6 +447,14 @@ INFO semantic_gateway · Gateway listo en 0.0.0.0:5433 · semantic.{events, item
 | `--port` | `SEMANTIC_GW_PORT` | `5433` | Puerto TCP |
 | `--user` / `--password` | `SEMANTIC_GW_USER` / `SEMANTIC_GW_PASSWORD` | `bi` / `bi` | Credencial única (MD5) |
 | `--log-level` | `SEMANTIC_GW_LOG_LEVEL` | `INFO` | `DEBUG` para más detalle |
+| `--ejecutar` | `SEMANTIC_GW_EJECUTAR=1` | apagado | Ejecuta en Athena y devuelve filas (sección 10.6) |
+| `--athena-workgroup` | `ATHENA_WORKGROUP` | `primary` | Workgroup de Athena |
+| `--athena-output` | `ATHENA_OUTPUT` | la del workgroup | `s3://…` donde Athena deja los resultados |
+| `--athena-catalog` | `ATHENA_CATALOG` | `awsdatacatalog` | Catálogo de datos (Glue) |
+| `--region` | `AWS_REGION` / `AWS_DEFAULT_REGION` | la del perfil | Región de Athena y Glue |
+| `--aws-profile` | `AWS_PROFILE` | credenciales por defecto | Perfil de `~/.aws/config` |
+| `--timeout` | `SEMANTIC_GW_TIMEOUT` | `100` | Segundos; al vencer se **cancela** la consulta en Athena. `0` = sin límite |
+| `--max-filas` | `SEMANTIC_GW_MAX_FILAS` | `0` (sin límite) | Corta el resultado en N filas y lo anota en el log |
 
 Con variables de entorno:
 
@@ -469,6 +482,70 @@ las resuelve igual (sección 14).
 
 El manifest se lee **solo al arrancar**. Después de un `dbt parse` hay que detener el gateway (`Ctrl+C`) y volver a
 lanzarlo. Lo mismo después de actualizar el código.
+
+### 10.6 Ejecutar en Athena y devolver filas
+
+Con `--ejecutar`, el gateway compila con MetricFlow (igual que antes), **ejecuta** ese SQL en Athena y devuelve las
+filas al cliente. El SQL compilado queda solo en el log. MetricFlow sigue sin conectarse a nada: ejecuta
+`executor.py`, como pide el ADR (el motor de métricas compila, otro componente ejecuta).
+
+| Conexión | Respuesta |
+| --- | --- |
+| `dbname=athena` (o `semantic`/sin dbname con `--motor athena`) | Filas de Athena, con las columnas en el orden y con los alias del `SELECT` |
+| `EXPLAIN SELECT …` | El SQL compilado, sin ejecutar |
+| `dbname=snowflake`, `redshift`… | El SQL compilado (no hay ejecutor para esos motores) |
+| Catálogo y sondas de los BI (`LIMIT 0`, `WHERE 1<>1`) | DuckDB, sin llamar a Athena |
+
+**Configuración en AWS**
+
+| Qué | Ejemplo |
+| --- | --- |
+| Credenciales en la máquina del gateway | `aws sso login --profile lab` y `--aws-profile lab` (o `AWS_PROFILE=lab`) |
+| Región | `--region us-east-1` |
+| Workgroup (motor v3, lee Iceberg) | `--athena-workgroup primary` |
+| Resultados en S3 | `--athena-output s3://<BUCKET>/athena-results/`; no hace falta si el workgroup impone su ubicación |
+| Tablas | Las bases de Glue del manifest deben existir: `lab_data_silver`, `lab_data_gold` y, para métricas acumuladas o rellenos, `lab_data.metricflow_time_spine` (`dbt run -s metricflow_time_spine`) |
+
+Permisos IAM del usuario o rol:
+
+- `athena:StartQueryExecution`, `GetQueryExecution`, `GetQueryResults`, `StopQueryExecution`, `GetWorkGroup`
+- `glue:GetDatabase`, `GetDatabases`, `GetTable`, `GetTables`, `GetPartitions`
+- `s3:GetObject`, `s3:ListBucket` sobre el bucket de datos (archivos y metadata de Iceberg)
+- `s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, `s3:GetBucketLocation` sobre la ruta de resultados
+- `lakeformation:GetDataAccess` si las tablas están bajo Lake Formation; `kms:Decrypt` / `kms:GenerateDataKey` si
+  los buckets usan KMS
+
+Una forma rápida de validar credenciales y permisos: ejecutar en la consola de Athena el SQL que hoy devuelve el gateway.
+
+**Instalar y levantar**
+
+```bash
+python -m pip install -r requirements-gateway.txt        # incluye pyathena[arrow]
+aws sso login --profile lab                              # o las credenciales que use la máquina
+
+python -m semantic_gateway --manifest semantic_manifests/dbt_glue_lab/semantic_manifest.json --motor athena \
+  --ejecutar --aws-profile lab --region us-east-1 \
+  --athena-workgroup primary --athena-output s3://<BUCKET>/athena-results/
+```
+
+**Log de una consulta ejecutada**
+
+```
+INFO … Ejecución en Athena · workgroup=primary · resultados=s3://… · región=us-east-1 · perfil=lab · timeout=100 s · max_filas=sin límite
+INFO … Consulta compilada · motor=athena metrics=['event_count'] group_by=['event__platform'] …
+---------- SQL athena ----------
+SELECT …
+----------------------------------
+INFO … Ejecutada en athena · query_id=1a2b… · 3 filas · 4.2 s · 12.3 MB escaneados
+```
+
+Si Athena rechaza la consulta (permisos, tabla inexistente) o vence `--timeout`, el cliente BI recibe el error con
+el mensaje de Athena y el log lo registra como `ERROR`.
+
+**Costo y límites.** Athena cobra por datos escaneados (5 USD por TB), no por filas devueltas: `--max-filas` no
+abarata nada, solo protege la memoria del gateway. Las consultas semánticas siempre agregan, así que el resultado suele
+ser chico. `--timeout` sí corta costo: cancela la consulta en Athena. Metabase lanza consultas solo al abrir
+preguntas y dashboards; el log de cada ejecución muestra los bytes escaneados.
 
 ---
 
@@ -780,7 +857,8 @@ Si aparece un error nuevo al conectar otro cliente, el log del gateway muestra l
 
 ## 16. Limitaciones
 
-- **No ejecuta:** devuelve solo el SQL compilado. Las tablas virtuales están vacías.
+- **Ejecuta solo en Athena** (con `--ejecutar`). Otros motores reciben el SQL compilado. Todas las conexiones usan la
+  misma credencial de AWS: no hay permisos por usuario. Las tablas virtuales del catálogo siguen vacías.
 - **Seguridad mínima:** un usuario con clave MD5, sin TLS, sin seguridad por filas ni auditoría. Solo en red privada.
 - **Tipos aproximados:** tiempo como `DATE`, el resto de dimensiones como `VARCHAR`, métricas como `DOUBLE`.
 - **SQL limitado:** sin `SELECT *`, expresiones, joins, subconsultas ni parámetros en consultas semánticas. El
@@ -806,14 +884,14 @@ Si aparece un error nuevo al conectar otro cliente, el log del gateway muestra l
 | Gateway | Autorización, RLS, PII | — | Pendiente |
 | Gateway | Caché de resultados | — | Pendiente |
 | Gateway | Gestor del manifiesto | Carga única al arrancar | Mínimo |
-| Gateway | Conectores de motor y enrutador | El cliente elige el dialecto con `dbname`; no se ejecuta | Parcial |
+| Gateway | Conectores de motor y enrutador | El cliente elige el motor con `dbname`; ejecutor de Athena (`executor.py`, `--ejecutar`) | Parcial (solo Athena) |
 | Metric engine | MetricFlow OSS embebido, solo compila | `engine.py` | Hecho |
 | Transversal | Validador en CI, sincronizador OpenMetadata, observabilidad | — | Pendiente |
 
 Próximos pasos sugeridos:
 
 1. **Recarga en caliente del manifest** (desde disco o S3), sin cortar conexiones.
-2. **Ejecutor** para un motor (Athena primero): ejecutar el SQL compilado y devolver filas.
+2. **Ejecutores** para otros motores (Snowflake, Redshift…), con la misma interfaz `Ejecutor` de `executor.py`.
 3. **Capa gateway** entre traductor y motor (autorización, RLS, caché), con `SemanticQuery` como contrato.
 4. **Catálogo en PostgreSQL real** si se necesitan varias réplicas o permisos por rol, cargado por CI desde el manifest.
 5. **Despliegue en AWS:** imagen de contenedor en EKS con alta disponibilidad (como pide el ADR), detrás de un balanceador
@@ -953,7 +1031,7 @@ No tiene lógica ni depende de otros archivos del paquete. Lo importan los otros
 | `motor_from_database(dbname, usuario, por_defecto)` | Traduce el `dbname` de la conexión a un motor: un motor conocido, el por defecto (`semantic`, vacío o igual al usuario) o un error que se informa en la primera consulta semántica | `MotorHandler.handle_startup` | Gateway (enrutador provisional: hoy elige el cliente) |
 | `_es_sonda(sql)` | Detecta `SELECT … WHERE 1<>1` o `LIMIT 0`: consultas de los BI que no piden datos | `SemanticSession.execute_sql` | Serving |
 | `SemanticSession` | Sesión de un cliente (una por conexión). Guarda `motor` y `motor_error` | `SemanticConnection.new_session` | Serving |
-| `SemanticSession.execute_sql(sql, params)` | Ruta de cada consulta: catálogo y sondas → DuckDB; consulta semántica → `translate` → `explain` → imprime el SQL en el log → lo devuelve en la columna `sql`. Rechaza parámetros y `dbname` inválido | buenavista | Serving; hoy cumple también el papel del gateway |
+| `SemanticSession.execute_sql(sql, params)` | Ruta de cada consulta: catálogo y sondas → DuckDB; consulta semántica → `translate` → `explain` → imprime el SQL en el log → si hay ejecutor para el motor (y no es `EXPLAIN`), ejecuta y devuelve las filas; si no, devuelve el SQL en la columna `sql`. Rechaza parámetros y `dbname` inválido | buenavista | Serving; hoy cumple también el papel del gateway |
 | `SemanticConnection` | Conexión a DuckDB compartida por todas las sesiones | `build_server` | Serving |
 | `SemanticConnection.parameters()` | Parámetros que el servidor anuncia al cliente: `server_version 14.0`, `UTF8`, `DateStyle ISO` | buenavista, al conectar | Serving |
 | `SemanticConnection.new_session()` | Abre un cursor de DuckDB con `search_path = semantic,main` y crea la `SemanticSession` | buenavista, al conectar | Serving |
@@ -974,7 +1052,19 @@ No tiene lógica ni depende de otros archivos del paquete. Lo importan los otros
 | `start_in_thread(…)` | Igual que `build_server`, pero deja el servidor corriendo en un hilo de fondo | `tests/test_gateway.py` | Pruebas |
 | `main()` | Punto de entrada de `python -m semantic_gateway`: lee argumentos y variables `SEMANTIC_GW_*`, configura el log y llama a `serve_forever` | `__main__.py` | Serving (arranque) |
 
-### 19.5 Recorrido de una consulta por las funciones
+### 19.5 `executor.py`: ejecución en Athena (Gateway, conector de motor)
+
+| Clase / función | Qué hace | La usa | Capa del ADR |
+| --- | --- | --- | --- |
+| `ConfigAthena` | Configuración: región, workgroup, ubicación de resultados, perfil, catálogo, `timeout`, `max_filas` | `main` | Gateway |
+| `EjecutorAthena(config)` | Abre una conexión de PyAthena (`ArrowCursor`); se crea una vez al arrancar | `main` | Gateway |
+| `EjecutorAthena.ejecutar(sql)` | Lanza la consulta en Athena en un hilo, espera hasta `timeout` (si vence, `StopQueryExecution`), lee el resultado como tabla Arrow, corta en `max_filas` y devuelve un `Resultado` | `SemanticSession.execute_sql` | Gateway |
+| `Resultado` | Tabla Arrow + `query_id`, segundos, bytes escaneados y si se truncó | `execute_sql` (log) | Gateway |
+| `ExecutionError` | Error de Athena o tiempo vencido; su mensaje llega al cliente como error SQL | `execute_sql` | Gateway |
+| `ordenar_columnas(tabla, salida)` | Pone las columnas en el orden del `SELECT` del cliente y con sus alias (MetricFlow devuelve primero las dimensiones; Athena, en minúsculas) | `execute_sql` | Serving |
+| `Ejecutor` (protocolo) | Interfaz común: `motor` y `ejecutar(sql) → Resultado`. Un ejecutor nuevo (Snowflake…) solo tiene que cumplirla | `build_server` | Gateway |
+
+### 19.6 Recorrido de una consulta por las funciones
 
 ```
 Cliente BI
@@ -996,5 +1086,7 @@ Cliente BI
                  ├─ _conjuncts ─► _where ─► _time_constraint | _metricflow_filter (to_jinja)
                  └─ _order_name, LIMIT              ─► SemanticQuery
               SemanticEngine.explain ─► _check ─► _engine_for ─► _request ─► MetricFlow
-              ─► SQL del motor: se imprime en el log y se devuelve en la columna sql
+              ─► SQL del motor: se imprime en el log
+              ├─ sin ejecutor o EXPLAIN ─► se devuelve en la columna sql
+              └─ con ejecutor (athena) ─► EjecutorAthena.ejecutar ─► ordenar_columnas ─► filas
 ```

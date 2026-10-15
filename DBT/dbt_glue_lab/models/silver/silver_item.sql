@@ -4,7 +4,7 @@
     iceberg_expire_snapshots='False', 
     table_properties={'format-version': '2'},
     partition_by=['created_at_date'],
-    custom_location='s3://<BUCKET>/silver/silver_item/'
+    custom_location='s3://' ~ env_var('DBT_S3_BUCKET') ~ '/silver/silver_item/'
 ) }}
 
 

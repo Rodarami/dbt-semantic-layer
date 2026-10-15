@@ -27,6 +27,7 @@ from buenavista import bv_dialects, postgres, rewrite
 from buenavista.backends.duckdb import DuckDBConnection, DuckDBQueryResult, DuckDBSession
 
 from .engine import MOTORES, SQLGLOT_DIALECT, SemanticEngine
+from .executor import ConfigAthena, Ejecutor, EjecutorAthena, ExecutionError, formato_bytes, ordenar_columnas
 from .model import Catalog
 from .translator import TranslationError, Translator, split_explain
 
@@ -233,15 +234,17 @@ def _es_sonda(sql: str) -> bool:
 
 
 class SemanticSession(DuckDBSession):
-    def __init__(self, cursor, engine: SemanticEngine, translator: Translator) -> None:
+    def __init__(self, cursor, engine: SemanticEngine, translator: Translator,
+                 ejecutores: dict[str, Ejecutor] | None = None) -> None:
         super().__init__(cursor)
         self._engine = engine
         self._translator = translator
+        self._ejecutores = ejecutores or {}  # motor → ejecutor; sin ejecutor se devuelve el SQL compilado
         self.motor: str = engine.motor  # lo fija el handler al conectar, según dbname
         self.motor_error: str | None = None
 
     def execute_sql(self, sql: str, params=None):
-        _, body = split_explain(sql)  # EXPLAIN y consulta normal se comportan igual: solo se imprime el SQL
+        es_explain, body = split_explain(sql)  # EXPLAIN devuelve el SQL compilado sin ejecutar
         if not self._translator.is_semantic(body):
             return super().execute_sql(sql, params)  # catálogo (DuckDB)
         if not params and _es_sonda(body):
@@ -259,14 +262,30 @@ class SemanticSession(DuckDBSession):
             self.motor, sq.metrics, sq.group_by, sq.where, sq.start, sq.end, sq.order_by, sq.limit,
             self.motor, sql_motor,
         )
-        return DuckDBQueryResult(pa.table({"sql": [sql_motor]}).to_reader(), status="SELECT")
+        ejecutor = self._ejecutores.get(self.motor)
+        if es_explain or ejecutor is None:
+            return DuckDBQueryResult(pa.table({"sql": [sql_motor]}).to_reader(), status="SELECT")
+
+        try:
+            resultado = ejecutor.ejecutar(sql_motor)
+        except ExecutionError as e:
+            logger.error("Falló la ejecución en %s: %s", self.motor, e)
+            raise
+        tabla = ordenar_columnas(resultado.tabla, sq.output)
+        logger.info("Ejecutada en %s · query_id=%s · %d filas · %.1f s · %s escaneados%s", self.motor,
+                    resultado.query_id or "-", tabla.num_rows, resultado.segundos,
+                    formato_bytes(resultado.bytes_escaneados),
+                    " · TRUNCADO por --max-filas" if resultado.truncado else "")
+        return DuckDBQueryResult(tabla.to_reader(), status="SELECT")
 
 
 class SemanticConnection(DuckDBConnection):
-    def __init__(self, db: duckdb.DuckDBPyConnection, engine: SemanticEngine, translator: Translator) -> None:
+    def __init__(self, db: duckdb.DuckDBPyConnection, engine: SemanticEngine, translator: Translator,
+                 ejecutores: dict[str, Ejecutor] | None = None) -> None:
         super().__init__(db)
         self._engine = engine
         self._translator = translator
+        self._ejecutores = ejecutores or {}
 
     def parameters(self) -> dict[str, str]:
         return {"server_version": "14.0", "client_encoding": "UTF8", "DateStyle": "ISO"}
@@ -274,7 +293,7 @@ class SemanticConnection(DuckDBConnection):
     def new_session(self) -> SemanticSession:
         cursor = self.db.cursor()
         cursor.execute(f"SET search_path='{self._translator.catalog.schema},main'")
-        return SemanticSession(cursor, self._engine, self._translator)
+        return SemanticSession(cursor, self._engine, self._translator, self._ejecutores)
 
 
 _PRIVILEGIOS = {"has_schema_privilege", "has_table_privilege", "has_any_column_privilege", "has_column_privilege",
@@ -434,7 +453,8 @@ class MotorServer(postgres.BuenaVistaServer):
 
 
 # ---------------------------------------------------------------------------------------------- arranque
-def build_server(host: str, port: int, user: str, password: str, manifest: str, motor: str) -> MotorServer:
+def build_server(host: str, port: int, user: str, password: str, manifest: str, motor: str,
+                 ejecutores: dict[str, Ejecutor] | None = None) -> MotorServer:
     engine = SemanticEngine(manifest, motor)
     postgres.dateutil = type("_Du", (), {"parser": _ParserSeguro})  # ver _ParserSeguro
     logging.getLogger("sqlglot").setLevel(logging.ERROR)  # avisos de SHOW/SET analizados como Command
@@ -447,18 +467,21 @@ def build_server(host: str, port: int, user: str, password: str, manifest: str, 
     if host not in ("127.0.0.1", "localhost"):
         os.environ["BUENAVISTA_HOST"] = host  # buenavista solo acepta conexiones remotas con esta variable
     server = MotorServer(
-        (host, port), SemanticConnection(db, engine, translator), rewriter=SemanticRewriter(translator),
+        (host, port), SemanticConnection(db, engine, translator, ejecutores), rewriter=SemanticRewriter(translator),
         auth={user: password},
     )
     logger.info(
-        "Gateway listo en %s:%d · %s.{%s} · motor por defecto=%s (dbname=<motor> lo cambia por conexión) · solo compila e imprime SQL · %d métricas · %d dimensiones",
-        host, port, SCHEMA, ", ".join(catalog.tables), motor, len(catalog.metrics), len(catalog.dimensions),
+        "Gateway listo en %s:%d · %s.{%s} · motor por defecto=%s (dbname=<motor> lo cambia por conexión) · %s · %d métricas · %d dimensiones",
+        host, port, SCHEMA, ", ".join(catalog.tables), motor,
+        f"ejecuta en: {', '.join(sorted(ejecutores))} (el resto solo compila)" if ejecutores else "solo compila y devuelve el SQL",
+        len(catalog.metrics), len(catalog.dimensions),
     )
     return server
 
 
-def start_in_thread(host: str, port: int, user: str, password: str, manifest: str, motor: str) -> MotorServer:
-    server = build_server(host, port, user, password, manifest, motor)
+def start_in_thread(host: str, port: int, user: str, password: str, manifest: str, motor: str,
+                    ejecutores: dict[str, Ejecutor] | None = None) -> MotorServer:
+    server = build_server(host, port, user, password, manifest, motor, ejecutores)
     threading.Thread(target=server.serve_forever, name="semantic-gateway", daemon=True).start()
     return server
 
@@ -473,10 +496,32 @@ def main() -> None:
     parser.add_argument("--user", default=os.environ.get("SEMANTIC_GW_USER", "bi"))
     parser.add_argument("--password", default=os.environ.get("SEMANTIC_GW_PASSWORD", "bi"))
     parser.add_argument("--log-level", default=os.environ.get("SEMANTIC_GW_LOG_LEVEL", "INFO"))
+    ejecucion = parser.add_argument_group("ejecución en Athena (sin --ejecutar el gateway solo devuelve el SQL)")
+    ejecucion.add_argument("--ejecutar", action="store_true", default=os.environ.get("SEMANTIC_GW_EJECUTAR", "") == "1",
+                           help="ejecuta en Athena las consultas de conexiones con dbname=athena y devuelve las filas")
+    ejecucion.add_argument("--athena-workgroup", default=os.environ.get("ATHENA_WORKGROUP", "primary"))
+    ejecucion.add_argument("--athena-output", default=os.environ.get("ATHENA_OUTPUT"),
+                           help="s3://… donde Athena deja los resultados (si el workgroup no impone una)")
+    ejecucion.add_argument("--athena-catalog", default=os.environ.get("ATHENA_CATALOG", "awsdatacatalog"))
+    ejecucion.add_argument("--region", default=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"))
+    ejecucion.add_argument("--aws-profile", default=os.environ.get("AWS_PROFILE"))
+    ejecucion.add_argument("--timeout", type=float, default=float(os.environ.get("SEMANTIC_GW_TIMEOUT", "100")),
+                           help="segundos; al vencer se cancela la consulta en Athena (0 = sin límite)")
+    ejecucion.add_argument("--max-filas", type=int, default=int(os.environ.get("SEMANTIC_GW_MAX_FILAS", "0")),
+                           help="corta el resultado en N filas (0 = sin límite, por defecto)")
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s · %(message)s")
-    server = build_server(args.host, args.port, args.user, args.password, args.manifest, args.motor)
+    ejecutores: dict[str, Ejecutor] = {}
+    if args.ejecutar:
+        ejecutores["athena"] = EjecutorAthena(ConfigAthena(
+            region=args.region, workgroup=args.athena_workgroup, output=args.athena_output, profile=args.aws_profile,
+            catalog=args.athena_catalog, timeout=args.timeout, max_filas=args.max_filas))
+        logger.info("Ejecución en Athena · workgroup=%s · resultados=%s · región=%s · perfil=%s · timeout=%s · max_filas=%s",
+                    args.athena_workgroup, args.athena_output or "(la del workgroup)", args.region or "(por defecto)",
+                    args.aws_profile or "(por defecto)", f"{args.timeout:.0f} s" if args.timeout else "sin límite",
+                    args.max_filas or "sin límite")
+    server = build_server(args.host, args.port, args.user, args.password, args.manifest, args.motor, ejecutores)
     try:
         server.serve_forever()
     finally:

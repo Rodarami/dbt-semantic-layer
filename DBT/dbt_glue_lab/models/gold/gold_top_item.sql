@@ -3,7 +3,7 @@
     incremental_strategy='insert_overwrite',
     iceberg_expire_snapshots='False', 
     table_properties={'format-version': '2'},
-    custom_location='s3://<BUCKET>/gold/gold_top_item/'
+    custom_location='s3://' ~ env_var('DBT_S3_BUCKET') ~ '/gold/gold_top_item/'
 ) }}
 
 -- Use CTEs
