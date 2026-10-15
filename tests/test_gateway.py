@@ -246,6 +246,7 @@ def probar_npgsql(manifest: str) -> None:
         r = lote([tipos, compuestos, enums])
         assert "E" not in r and r.count("D") > 20 and r.count("C") == 3, r       # tres resultados, sin error
         assert lote(["SELECT x FROM tabla_que_no_existe", enums]) == "12EZ"      # tras el error: nada hasta Sync
+        assert "E" not in lote(["DISCARD ALL", "RESET ALL", "DEALLOCATE ALL", "UNLISTEN *"])  # limpieza del pool
         sock.close()
     finally:
         server.shutdown()

@@ -311,6 +311,7 @@ _FUNCIONES_PROPIAS = {
     "pg_table_size": "(a) AS 0::BIGINT",
     "pg_indexes_size": "(a) AS 0::BIGINT",
     "pg_stat_get_numscans": "(a) AS 0::BIGINT",
+    "pg_advisory_unlock_all": "() AS NULL",  # Npgsql al reutilizar conexiones
     # función de tabla: DBeaver pide las palabras reservadas para resaltar la sintaxis
     "pg_get_keywords": "() AS TABLE SELECT lower(keyword_name) AS word, CASE keyword_category WHEN 'reserved' THEN 'R' "
                        "WHEN 'unreserved' THEN 'U' WHEN 'type_function' THEN 'T' ELSE 'C' END AS catcode, "
@@ -402,6 +403,12 @@ _NPGSQL_TIPOS = [
 ]
 
 
+# Comandos con que los drivers limpian la sesión (Npgsql/Power BI los envía al reutilizar una conexión del pool).
+# El gateway no guarda estado de sesión que limpiar: se responden como un comando sin efecto.
+_REINICIO_SESION = re.compile(r"\s*(discard\s+all|discard\s+(plans|sequences|temp|temporary)|reset\s+all|deallocate\s+all"
+                              r"|unlisten\s+\*|close\s+all|set\s+session\s+authorization\s+default)\s*;?\s*$", re.I)
+
+
 def _consulta_npgsql(sql: str) -> str | None:
     """Consultas de catálogo que Npgsql (Power BI) envía al conectar y que DuckDB no puede responder.
 
@@ -441,6 +448,8 @@ class SemanticRewriter(rewrite.Rewriter):
             return "SELECT 'PostgreSQL 14.0 (gateway semántico sobre MetricFlow)' AS version"
         if re.match(r"\s*(begin|start\s+transaction)\b", sql, flags=re.I):
             return "BEGIN"  # BEGIN READ ONLY / ISOLATION LEVEL … no existen en DuckDB
+        if _REINICIO_SESION.match(sql):  # DISCARD ALL, RESET ALL… (Npgsql al reutilizar conexiones): sin efecto
+            return "SET enable_progress_bar = false"
         npgsql = _consulta_npgsql(sql)
         if npgsql is not None:
             return npgsql
