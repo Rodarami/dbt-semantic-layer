@@ -519,6 +519,11 @@ class MotorHandler(postgres.BuenaVistaHandler):
 
 
 class MotorServer(postgres.BuenaVistaServer):
+    # Un hilo por conexión. Como daemon y sin esperarlos al cerrar: con Ctrl+C el proceso termina aunque un cliente
+    # (DBeaver, Power BI) siga conectado; si no, la consola queda esperando a que esos clientes se desconecten.
+    daemon_threads = True
+    block_on_close = False
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.RequestHandlerClass = MotorHandler
@@ -596,5 +601,7 @@ def main() -> None:
     server = build_server(args.host, args.port, args.user, args.password, args.manifest, args.motor, ejecutores)
     try:
         server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Gateway detenido (Ctrl+C)")
     finally:
-        server.shutdown()
+        server.server_close()  # libera el puerto; las conexiones abiertas se cierran con el proceso
