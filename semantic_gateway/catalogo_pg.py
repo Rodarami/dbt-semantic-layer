@@ -58,6 +58,26 @@ def _install_pg_views(db: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+# Tipos de columna con los nombres de PostgreSQL. DuckDB informa VARCHAR, DOUBLE, DATE…; Power BI en DirectQuery
+# valida los tipos antes de generar SQL y, si no los reconoce, no pliega la consulta ("No se ha podido plegar la
+# expresión al origen de datos"). Coinciden con los OID de gw_pg_attribute (texto = text, 25).
+_TIPOS_PG_COLUMNAS = (
+    "CASE WHEN upper(data_type) LIKE 'VARCHAR%' THEN 'text' WHEN upper(data_type) = 'DOUBLE' THEN 'double precision' "
+    "WHEN upper(data_type) = 'FLOAT' THEN 'real' WHEN upper(data_type) = 'BIGINT' THEN 'bigint' "
+    "WHEN upper(data_type) = 'INTEGER' THEN 'integer' WHEN upper(data_type) = 'SMALLINT' THEN 'smallint' "
+    "WHEN upper(data_type) = 'BOOLEAN' THEN 'boolean' WHEN upper(data_type) = 'DATE' THEN 'date' "
+    "WHEN upper(data_type) LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 'timestamp with time zone' "
+    "WHEN upper(data_type) LIKE 'TIMESTAMP%' THEN 'timestamp without time zone' "
+    "WHEN upper(data_type) LIKE 'DECIMAL%' THEN 'numeric' ELSE lower(data_type) END AS data_type, "
+    "CASE WHEN upper(data_type) LIKE 'VARCHAR%' THEN 'text' WHEN upper(data_type) = 'DOUBLE' THEN 'float8' "
+    "WHEN upper(data_type) = 'FLOAT' THEN 'float4' WHEN upper(data_type) = 'BIGINT' THEN 'int8' "
+    "WHEN upper(data_type) = 'INTEGER' THEN 'int4' WHEN upper(data_type) = 'SMALLINT' THEN 'int2' "
+    "WHEN upper(data_type) = 'BOOLEAN' THEN 'bool' WHEN upper(data_type) = 'DATE' THEN 'date' "
+    "WHEN upper(data_type) LIKE 'TIMESTAMP WITH TIME ZONE%' THEN 'timestamptz' "
+    "WHEN upper(data_type) LIKE 'TIMESTAMP%' THEN 'timestamp' WHEN upper(data_type) LIKE 'DECIMAL%' THEN 'numeric' "
+    "ELSE lower(data_type) END AS udt_name"
+)
+
 def install_catalog(db: duckdb.DuckDBPyConnection, catalog: Catalog) -> None:
     """Crea en DuckDB las tablas virtuales (vacías, con tipos y descripciones) y las tablas de metadatos."""
     s = catalog.schema
@@ -86,7 +106,9 @@ def install_catalog(db: duckdb.DuckDBPyConnection, catalog: Catalog) -> None:
     # information_schema sin el esquema `main` (vistas y macros auxiliares del gateway): así los navegadores de los BI
     # (Power BI, Metabase) solo muestran el esquema `semantic`
     for vista, columna in _INFO_SIN_MAIN.items():
-        db.execute(f"CREATE VIEW main.gw_info_{vista} AS SELECT * FROM information_schema.{vista} WHERE {columna} <> 'main'")
+        reemplazo = f" REPLACE ({_TIPOS_PG_COLUMNAS})" if vista == "columns" else ""
+        db.execute(f"CREATE VIEW main.gw_info_{vista} AS SELECT *{reemplazo} FROM information_schema.{vista} "
+                   f"WHERE {columna} <> 'main'")
     # lo mismo en pg_catalog: Metabase sincroniza las tablas leyendo pg_class y pg_namespace
     db.execute("CREATE VIEW main.gw_pg_namespace AS SELECT * FROM pg_catalog.pg_namespace WHERE nspname <> 'main'")
     db.execute("CREATE VIEW main.gw_pg_class AS SELECT * FROM pg_catalog.pg_class WHERE relnamespace NOT IN "
@@ -224,6 +246,12 @@ _PRIVILEGIOS = {"has_schema_privilege", "has_table_privilege", "has_any_column_p
 # expresiones por defecto, tablespaces ni estadísticas.
 _FUNCIONES_PROPIAS = {
     "pg_get_expr": "(a, b) AS NULL::VARCHAR, (a, b, c) AS NULL::VARCHAR",
+    # nombre del tipo según PostgreSQL (el format_type de DuckDB no conoce varios OID, p. ej. 1082 = date)
+    "format_type": "(oid, typmod) AS CASE oid WHEN 25 THEN 'text' WHEN 1043 THEN 'character varying' "
+                   "WHEN 701 THEN 'double precision' WHEN 700 THEN 'real' WHEN 20 THEN 'bigint' WHEN 23 THEN 'integer' "
+                   "WHEN 21 THEN 'smallint' WHEN 16 THEN 'boolean' WHEN 1082 THEN 'date' "
+                   "WHEN 1114 THEN 'timestamp without time zone' WHEN 1184 THEN 'timestamp with time zone' "
+                   "WHEN 1700 THEN 'numeric' ELSE NULL END",
     "pg_get_partkeydef": "(a) AS NULL::VARCHAR",
     "pg_tablespace_location": "(a) AS NULL::VARCHAR",
     # tamaños y estadísticas (DBeaver los muestra en las propiedades de tablas e índices): 0

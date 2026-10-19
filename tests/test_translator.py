@@ -98,8 +98,13 @@ def test_envoltorios_de_power_bi() -> None:
     sq = T.translate(f'select "_"."event__platform" as p from ({nativa}) "_" '
                      f'where "_"."event__platform" <> \'web\' order by "_"."event__platform"')
     assert sq.output == [("event__platform", "p")] and sq.order_by == ["event__platform"] and len(sq.where) == 1
-    for sql, msg in [  # lo que no es un simple envoltorio se sigue rechazando
-        (f'select sum("_"."item_views") from ({nativa}) "_"', "subconsultas"),
+    # DirectQuery: agrupar y sumar afuera = la métrica al nivel de las columnas agrupadas
+    sq = T.translate(f'select "rows"."event__platform", sum("rows"."item_views") as "a0" from ({nativa}) "rows" '
+                     f'group by "event__platform" limit 1000001')
+    assert (sq.metrics, sq.group_by, sq.output) == (["item_views"], ["event__platform"],
+                                                    [("event__platform", "event__platform"), ("item_views", "a0")])
+    for sql, msg in [  # lo que no es un envoltorio aceptado se sigue rechazando
+        (f'select count(*) from ({nativa}) "_"', "subconsultas"),
         (f'select "_"."x" from ({nativa}) "_"', "desconocida"),
         (f'select * from ({nativa}) "_" where "_"."item_views" > 3', "métrica"),
     ]:

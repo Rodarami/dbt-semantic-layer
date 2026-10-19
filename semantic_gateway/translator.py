@@ -219,6 +219,9 @@ class Translator:
         return name
 
 
+_AGREGACIONES = (exp.Sum, exp.Max, exp.Min, exp.Avg)  # aceptadas sobre una métrica (la agregación la define la métrica)
+
+
 def _salida(proyeccion: exp.Expression) -> str:
     """Nombre con que una columna sale de una consulta: su alias o el nombre de la columna."""
     if isinstance(proyeccion, exp.Alias):
@@ -241,7 +244,7 @@ def _aplanar(tree: exp.Select) -> exp.Select:
         sub = origen.this if origen is not None else None
         if not (isinstance(sub, exp.Subquery) and isinstance(sub.this, exp.Select)):
             return tree
-        for arg in ("joins", "group", "having", "offset", "with", "distinct"):
+        for arg in ("joins", "having", "offset", "with"):
             if tree.args.get(arg):
                 return tree  # no es un simple envoltorio: _check_shape lo rechaza
         interna = sub.this.copy()
@@ -260,8 +263,13 @@ def _aplanar(tree: exp.Select) -> exp.Select:
                 continue
             nombre_salida = p.alias if isinstance(p, exp.Alias) else None
             col = p.unalias()
+            if isinstance(col, _AGREGACIONES) and isinstance(col.this, exp.Column):
+                # DirectQuery: SUM("_"."metrica") agrupado afuera = la métrica al nivel de las columnas agrupadas
+                base = col.__class__(this=interna_de(col.this).unalias().copy())
+                proyecciones.append(exp.alias_(base, nombre_salida or col.this.name, quoted=True))
+                continue
             if not isinstance(col, exp.Column):
-                return tree  # el envoltorio calcula algo (SUM, COUNT…): no se aplana
+                return tree  # el envoltorio calcula otra cosa (COUNT(*), expresiones…): no se aplana
             base = interna_de(col).unalias().copy()
             nombre = nombre_salida or col.name
             proyecciones.append(base if isinstance(base, exp.Column) and base.name == nombre
@@ -281,6 +289,9 @@ def _aplanar(tree: exp.Select) -> exp.Select:
         orden = tree.args.get("order")
         if orden is not None:
             interna.set("order", orden.transform(a_interna))
+        if tree.args.get("distinct"):
+            interna.set("distinct", tree.args["distinct"].copy())
+        # GROUP BY de afuera: las dimensiones del SELECT ya definen la agrupación (es implícita en la capa semántica)
         limite = tree.args.get("limit")
         if limite is not None:
             previo = interna.args.get("limit")
