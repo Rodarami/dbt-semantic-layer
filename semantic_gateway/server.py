@@ -122,7 +122,12 @@ class ConexionSemantica(riffq.BaseConnection):
     def _responder(self, sql: str, callback, describir: bool, parametros) -> None:
         try:
             resultado = self._resolver(self._original(sql, describir), describir, parametros)
-        except (TranslationError, ExecutionError) as e:
+        except TranslationError as e:
+            # se registra el SQL tal como llegó: así se ve qué genera cada cliente BI (p. ej. Power BI en DirectQuery)
+            logger.warning("Consulta rechazada: %s\n---------- SQL recibido ----------\n%s\n----------------------------------",
+                           e, sql.strip())
+            return callback(("ERROR", "42000", str(e)), is_error=True)
+        except ExecutionError as e:
             return callback(("ERROR", "42000", str(e)), is_error=True)
         except duckdb.Error as e:
             return callback(("ERROR", "42000", str(e).splitlines()[0]), is_error=True)
