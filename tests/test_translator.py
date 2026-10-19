@@ -140,8 +140,26 @@ def test_rejections() -> None:
             raise AssertionError(f"Se esperaba error: {sql}")
 
 
+def test_nucleo_y_resto() -> None:
+    from tests.test_gateway import _PBI_FECHA
+    from semantic_gateway.translator import NUCLEO
+    try:
+        T.translate(_PBI_FECHA)
+        raise AssertionError("debía rechazar el CASE")
+    except TranslationError:
+        pass
+    nucleo, resto = T.separar_nucleo(_PBI_FECHA)
+    assert T.translate(nucleo).group_by == ["event__event_date"]
+    assert NUCLEO in resto and "semantic.events" not in resto.replace('"', "") and "CASE" in resto
+    assert T.separar_nucleo("SELECT item_views FROM semantic.events") is None              # sin envoltorio
+    assert T.separar_nucleo("SELECT * FROM (SELECT item_views FROM semantic.events) a, pg_class b") is None
+    assert T.separar_nucleo("SELECT * FROM (SELECT item_views FROM events) a JOIN (SELECT total_item_price "
+                            "FROM items) b ON true") is None                                  # dos núcleos
+
+
 if __name__ == "__main__":
     tests = [f for name, f in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:
         test()
     print(f"OK · {len(tests)} pruebas del traductor")
+

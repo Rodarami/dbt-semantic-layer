@@ -370,6 +370,14 @@ def probar_tls_obligatorio(manifest: str) -> None:
     print("OK · TLS obligatorio: sin SSL se rechaza, con SSL funciona")
 
 
+_PBI_FECHA = (  # SQL real de Power BI DirectQuery para una tabla con una columna de fecha
+    'select "_"."event__event_date" as "c8" from (select "rows"."event__event_date" as "event__event_date", '
+    'case when "rows"."o0" is not null then cast("rows"."o0" as timestamp) else timestamp \'1899-12-28 00:00:00\' '
+    'end as "t0_0", case when "rows"."o0" is null then 0 else 1 end as "t1_0" from (select "event__event_date" as '
+    '"event__event_date", "event__event_date" as "o0" from "semantic"."events" "$Table" group by '
+    '"event__event_date","o0") "rows") "_" order by "_"."t0_0", "_"."t1_0" limit 501')
+
+
 class _EjecutorFalso:
     """Simula Athena: guarda el SQL recibido y devuelve filas fijas (MetricFlow pone dimensiones primero)."""
     motor = "athena"
@@ -414,6 +422,12 @@ def probar_ejecucion(manifest: str) -> None:
             assert [d.name for d in cur.description] == ["metric_time", "metric_time__day", "event_count"]
             fila = cur.fetchone()
             assert [str(fila[0]), str(fila[1])] == ["2024-01-02", "2024-01-02"] and float(fila[2]) == 3, fila
+            # Power BI DirectQuery: visual de fecha envuelto en CASE/cast/orden → núcleo en Athena, resto en DuckDB
+            n_antes = len(falso.sql)
+            cur = c.execute(_PBI_FECHA)
+            assert [d.name for d in cur.description] == ["c8"], cur.description
+            assert [str(f[0]) for f in cur.fetchall()] == ["2024-01-01"]
+            assert len(falso.sql) == n_antes + 1 and "CASE" not in falso.sql[-1].upper()  # a Athena va solo el núcleo
         with psycopg.connect(f"host=127.0.0.1 port={port} user=bi password=bi dbname=athena", autocommit=True,
                              prepare_threshold=0) as c:                              # protocolo extendido
             c.execute("SELECT event__platform, event_count FROM semantic.events WHERE event__platform = 'IOS'").fetchall()

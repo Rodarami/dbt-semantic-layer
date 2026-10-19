@@ -105,6 +105,34 @@ class Translator:
             sq.limit = int(value.this)
         return sq
 
+    def separar_nucleo(self, sql: str) -> Optional[tuple[str, str]]:
+        """Divide una consulta de un BI en *núcleo* y *resto*.
+
+        El núcleo es la única subconsulta que lee una tabla semántica: va a MetricFlow y al motor. El resto es todo lo
+        que el BI agrega alrededor (casts, CASE, orden, límites…): se ejecuta en DuckDB sobre el resultado del núcleo,
+        leyendo la tabla `NUCLEO`. Devuelve None si la consulta no tiene esa forma.
+        """
+        try:
+            tree = sqlglot.parse_one(sql, read=self.read)
+        except sqlglot.errors.ParseError:
+            return None
+        if tree is None:
+            return None
+        nucleos = [s for s in tree.find_all(exp.Select) if self._lee_tabla_semantica(s)]
+        if len(nucleos) != 1 or nucleos[0] is tree:
+            return None
+        nucleo = nucleos[0]
+        sql_nucleo = nucleo.sql(dialect=self.read)
+        nucleo.replace(sqlglot.parse_one(f"SELECT * FROM {NUCLEO}"))
+        if any(t.name != NUCLEO for t in tree.find_all(exp.Table)):
+            return None  # el resto lee otra tabla: no se acepta
+        return sql_nucleo, tree.sql(dialect=self.read)
+
+    def _lee_tabla_semantica(self, select: exp.Select) -> bool:
+        origen = select.args.get("from_") or select.args.get("from")
+        tabla = origen.this if origen is not None else None
+        return isinstance(tabla, exp.Table) and tabla.name.lower() in self.catalog.tables and not select.args.get("joins")
+
     # ------------------------------------------------------------------ piezas
     def _check_shape(self, tree: exp.Select) -> str:
         """Valida la forma de la consulta y devuelve el nombre de la tabla virtual que lee."""
@@ -219,6 +247,7 @@ class Translator:
         return name
 
 
+NUCLEO = "__nucleo_semantico"  # tabla con el resultado del núcleo, para ejecutar el resto en DuckDB
 _AGREGACIONES = (exp.Sum, exp.Max, exp.Min, exp.Avg)  # aceptadas sobre una métrica (la agregación la define la métrica)
 
 

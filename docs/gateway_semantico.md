@@ -55,7 +55,7 @@ la capa semántica como si fueran columnas de una tabla.
 | Motores (dialectos) | athena, bigquery, databricks, duckdb, postgres, redshift, snowflake, trino |
 | Cómo se elige el motor | En cada conexión, con el nombre de la base de datos (`dbname=snowflake`) |
 | Fuente de verdad | Un `semantic_manifest.json` de `semantic_manifests/` (uno por proyecto dbt), generado por `dbt parse`. Se lee una vez al arrancar |
-| Clientes probados | psql/psycopg, Jupyter, DBeaver, Metabase (conexión, sincronización de esquema y SQL nativo) y Power BI en modo Importar (catálogo de Npgsql) |
+| Clientes probados | psql/psycopg, Jupyter, DBeaver, Metabase (conexión, sincronización de esquema y SQL nativo) y Power BI en modo Importar y DirectQuery (catálogo de Npgsql; envoltorios de subconsultas, `CASE` y `cast`) |
 | Seguridad de la conexión | Usuario y clave fijos; TLS opcional (`--tls-cert`/`--tls-key`) u obligatorio (`--tls-obligatorio`) (sección 10.7) |
 
 ---
@@ -267,6 +267,16 @@ La lista completa de clases y funciones, con quién las llama y su capa del ADR,
 - `translate(sql, dialect)`: parsea con `sqlglot.parse_one`, llama a `_check_shape` (una sola tabla virtual, sin joins,
   subconsultas, `HAVING`, `OFFSET` ni `WITH`) y clasifica cada columna del `SELECT` como métrica o dimensión **de esa
   tabla**.
+- Envoltorios de Power BI. Power BI no manda la consulta tal cual: la envuelve en subconsultas propias. El traductor
+  las resuelve en dos niveles:
+  - `_aplanar`: si las capas externas solo renombran columnas, filtran, ordenan, limitan o agregan con
+    `SUM/MAX/MIN/AVG` (Importar y DirectQuery de medidas), se funden en una sola consulta semántica.
+  - `separar_nucleo(sql)`: si además calculan cosas que MetricFlow no entiende (DirectQuery de fechas: `CASE`,
+    `cast(… as timestamp)`, banderas de nulos, `limit 501`), la **única** subconsulta que lee una tabla semántica es
+    el *núcleo* y va a MetricFlow y al motor; el *resto* se ejecuta en una base DuckDB efímera y blindada (sin
+    archivos ni red, una sola sentencia `SELECT`) sobre el resultado del núcleo, que ya viene agregado y es chico.
+    Solo con motor ejecutor (`dbname=athena`); en `EXPLAIN` o sin ejecutor se devuelve el SQL del núcleo. Si hay dos
+    núcleos (joins entre tablas semánticas) o el resto lee otra tabla, se rechaza.
 - `_unknown_column`: si la columna existe en otra tabla, el error lo dice: *La columna 'item__category' no está en la
   tabla 'events'; está en: items*.
 - `_where` y `_time_constraint`: las condiciones sobre `metric_time*` con `>=`, `<=`, `=` o `BETWEEN` y fecha literal se
@@ -820,7 +830,7 @@ pestaña del driver, desactivar *Show all databases*.
 | Columnas de dos tablas | *La columna 'item__category' no está en la tabla 'events'; está en: items…* |
 | Filtro sobre una métrica | *No se puede filtrar por la métrica 'event_count' (HAVING no está soportado)* |
 | `COUNT(*)` u otras expresiones | *Expresión no soportada: COUNT(\*) (use columnas de la tabla semántica)* |
-| Joins, subconsultas, `HAVING`, `OFFSET`, `WITH` | *… no está soportado en la capa semántica* |
+| Joins, subconsultas, `HAVING`, `OFFSET`, `WITH` | *… no está soportado en la capa semántica* (salvo los envoltorios de Power BI: subconsultas que se aplanan, o un núcleo semántico con el resto ejecutado en DuckDB) |
 | Parámetros (`$1`) en consultas semánticas | *La capa semántica no admite parámetros…* |
 
 Las sondas que usan los BI (`SELECT … FROM semantic.<modelo> WHERE 1<>1` o `LIMIT 0`) no se rechazan: devuelven cero
@@ -1063,7 +1073,7 @@ Si aparece un error nuevo al conectar otro cliente, el log del gateway muestra l
 | Artefacto del ADR | Componente | Pieza en el código | Estado |
 | --- | --- | --- | --- |
 | Semantic models | Definición de métricas | `schema.yml`, `metrics.yml`, `dbt parse` | Hecho |
-| Serving layer | Endpoint Postgres wire | `server.py` (riffq + catálogo DuckDB); `server_old.py` (buenavista) como respaldo | Hecho (PoC), probado con DBeaver y Metabase; Power BI en prueba |
+| Serving layer | Endpoint Postgres wire | `server.py` (riffq + catálogo DuckDB); `server_old.py` (buenavista) como respaldo | Hecho (PoC), probado con DBeaver, Metabase y Power BI (Importar y DirectQuery) |
 | Serving layer | Traductor de peticiones | `translator.py`, `model.py` | Hecho |
 | Serving layer | Publicación por dominio | Una tabla por modelo semántico (`engine._tables`) | Hecho |
 | Serving layer | Autenticación OIDC/SAML | Usuario y clave fijos en `handle_auth` (punto de extensión para OIDC); TLS opcional | Mínimo |
@@ -1187,6 +1197,7 @@ No tiene lógica ni depende de otros archivos del paquete. Lo importan los otros
 | `Translator(catalog, read, warehouse_dialect)` | Guarda el catálogo, el dialecto de entrada (`postgres`) y el dialecto por defecto para escribir filtros | `build_server` | Serving |
 | `Translator.is_semantic(sql)` | Decide la ruta: ¿la consulta lee alguna tabla virtual `semantic.<modelo>`? Si no, la responde el catálogo | `SemanticSession.execute_sql`, `SemanticRewriter.rewrite` | Serving |
 | `Translator.translate(sql, dialect)` | Paso principal. Parsea con `sqlglot.parse_one`, valida la forma, clasifica cada columna del `SELECT` en métrica o dimensión de la tabla, procesa `WHERE`, `ORDER BY` y `LIMIT`, y devuelve el `SemanticQuery` | `SemanticSession.execute_sql` | Serving |
+| `Translator.separar_nucleo(sql)` | Si la consulta tiene una sola subconsulta que lee una tabla semántica, devuelve `(núcleo, resto)`; el resto lee la tabla `__nucleo_semantico` y se ejecuta con `server._resto_en_duckdb` | `ConexionSemantica._semantica` (cuando `translate` rechaza) | Serving |
 | `Translator._check_shape(árbol)` | Exige una sola tabla virtual y rechaza joins, `HAVING`, `OFFSET`, `WITH` y subconsultas. Devuelve el nombre de la tabla | `translate` | Serving |
 | `Translator._unknown_column(nombre, tabla)` | Arma el error de columna desconocida; si existe en otra tabla, lo dice (*está en: items*) | `translate`, `_where` | Serving |
 | `Translator._column(nodo)` | Extrae el nombre de la columna, aceptando que venga dentro de `SUM/MAX/MIN/AVG/MEASURE/AGG`; rechaza otras expresiones (`COUNT(*)`, `x * 2`) | `translate`, `_order_name` | Serving |

@@ -36,7 +36,7 @@ from .catalogo_pg import (SCHEMA, _consulta_vacia, _es_sonda, blindar, install_c
 from .engine import MOTORES, SQLGLOT_DIALECT, SemanticEngine
 from .tls_obligatorio import PuertaTLS, puerto_libre
 from .executor import ConfigAthena, Ejecutor, EjecutorAthena, ExecutionError, formato_bytes, ordenar_columnas
-from .translator import TranslationError, Translator, split_explain
+from .translator import NUCLEO, TranslationError, Translator, split_explain
 
 logger = logging.getLogger("semantic_gateway")
 logger_sql = logging.getLogger("semantic_gateway.sql")  # cada consulta recibida; se activa con --log-sql
@@ -185,7 +185,13 @@ class ConexionSemantica(riffq.BaseConnection):
             raise TranslationError("La capa semántica no admite parámetros: envíe la consulta con literales")
         if self.motor_error:
             raise TranslationError(self.motor_error)
-        sq = self.translator.translate(cuerpo, dialect=SQLGLOT_DIALECT[self.motor])
+        try:
+            sq = self.translator.translate(cuerpo, dialect=SQLGLOT_DIALECT[self.motor])
+        except TranslationError:
+            partes = self.translator.separar_nucleo(cuerpo)
+            if partes is None:
+                raise
+            return self._nucleo_y_resto(*partes, es_explain=es_explain, describir=describir)
         ejecutor = self.ejecutores.get(self.motor)
         devuelve_sql = es_explain or ejecutor is None
         esquema = pa.schema([("sql", pa.string())]) if devuelve_sql else self._esquema(sq)
@@ -213,6 +219,31 @@ class ConexionSemantica(riffq.BaseConnection):
                     " · TRUNCADO por --max-filas" if resultado.truncado else "")
         return tabla
 
+    def _nucleo_y_resto(self, sql_nucleo: str, sql_resto: str, es_explain: bool, describir: bool) -> pa.Table:
+        """Consultas que los BI envuelven con cálculos propios (Power BI en DirectQuery: casts, CASE, orden de nulos…).
+        El núcleo (lo que lee la tabla semántica) va a MetricFlow y al motor; el resto se ejecuta en DuckDB sobre ese
+        resultado, que ya viene agregado y es chico."""
+        sq = self.translator.translate(sql_nucleo, dialect=SQLGLOT_DIALECT[self.motor])
+        ejecutor = self.ejecutores.get(self.motor)
+        if es_explain or ejecutor is None:  # sin ejecutor no hay filas sobre las que aplicar el resto
+            if describir:
+                return pa.schema([("sql", pa.string())]).empty_table()
+            return pa.table({"sql": [self.engine.explain(sq, self.motor)]})
+        esquema = self._esquema(sq)
+        if describir:  # la forma del resultado: el resto aplicado a un núcleo vacío, sin ir al motor
+            return _resto_en_duckdb(sql_resto, esquema.empty_table()).schema.empty_table()
+        sql_motor = self.engine.explain(sq, self.motor)
+        logger.info("Consulta compilada (núcleo; el resto se aplica en DuckDB) · motor=%s metrics=%s group_by=%s "
+                    "where=%s\n---------- SQL %s ----------\n%s\n----------------------------------",
+                    self.motor, sq.metrics, sq.group_by, sq.where, self.motor, sql_motor)
+        resultado = ejecutor.ejecutar(sql_motor)
+        nucleo = _ajustar_tipos(ordenar_columnas(resultado.tabla, sq.output), esquema)
+        tabla = _resto_en_duckdb(sql_resto, nucleo)
+        logger.info("Ejecutada en %s · query_id=%s · núcleo %d filas → %d filas · %.1f s · %s escaneados", self.motor,
+                    resultado.query_id or "-", nucleo.num_rows, tabla.num_rows, resultado.segundos,
+                    formato_bytes(resultado.bytes_escaneados))
+        return tabla
+
     def _esquema(self, sq) -> pa.Schema:
         """Tipos del resultado según el catálogo (los mismos que se informan al describir)."""
         catalogo = self.translator.catalog
@@ -221,6 +252,22 @@ class ConexionSemantica(riffq.BaseConnection):
             tipo = catalogo.dimensions[columna].data_type if columna in catalogo.dimensions else "DOUBLE"
             campos.append((publicada, _TIPO_ARROW.get(tipo, pa.string())))
         return pa.schema(campos)
+
+
+def _resto_en_duckdb(sql_resto: str, nucleo: pa.Table) -> pa.Table:
+    """Ejecuta el *resto* de la consulta del BI sobre el resultado del núcleo, en una base DuckDB efímera y blindada
+    (sin archivos, red ni extensiones; solo una sentencia SELECT que lee la tabla del núcleo)."""
+    con = duckdb.connect()
+    try:
+        con.register("__nucleo_arrow", nucleo)
+        con.execute(f"CREATE TABLE {NUCLEO} AS SELECT * FROM __nucleo_arrow")
+        con.unregister("__nucleo_arrow")
+        blindar(con)
+        consulta = reescribir(sql_resto)
+        solo_lectura(consulta)
+        return con.execute(consulta).fetch_arrow_table()
+    finally:
+        con.close()
 
 
 def _ajustar_tipos(tabla: pa.Table, esquema: pa.Schema) -> pa.Table:
