@@ -39,6 +39,8 @@ from .executor import ConfigAthena, Ejecutor, EjecutorAthena, ExecutionError, fo
 from .translator import TranslationError, Translator, split_explain
 
 logger = logging.getLogger("semantic_gateway")
+logger_sql = logging.getLogger("semantic_gateway.sql")  # cada consulta recibida; se activa con --log-sql
+logger_sql.setLevel(logging.WARNING)
 
 # Tipo de cada columna del catálogo semántico → tipo Arrow del resultado (el que se informa al describir)
 _TIPO_ARROW = {"DATE": pa.date32(), "VARCHAR": pa.string(), "DOUBLE": pa.float64(), "BIGINT": pa.int64(),
@@ -120,8 +122,9 @@ class ConexionSemantica(riffq.BaseConnection):
                              kwargs.get("query_args"))
 
     def _responder(self, sql: str, callback, describir: bool, parametros) -> None:
+        sql = self._original(sql, describir)
         try:
-            resultado = self._resolver(self._original(sql, describir), describir, parametros)
+            resultado = self._resolver(sql, describir, parametros)
         except TranslationError as e:
             # se registra el SQL tal como llegó: así se ve qué genera cada cliente BI (p. ej. Power BI en DirectQuery)
             logger.warning("Consulta rechazada: %s\n---------- SQL recibido ----------\n%s\n----------------------------------",
@@ -135,7 +138,10 @@ class ConexionSemantica(riffq.BaseConnection):
             logger.exception("Error inesperado")
             return callback(("ERROR", "XX000", str(e)), is_error=True)
         if isinstance(resultado, str):
+            logger_sql.info("%s%s\n  → etiqueta %s", "[describe] " if describir else "", sql.strip(), resultado or "(vacía)")
             return callback(resultado, is_tag=True)
+        logger_sql.info("%s%s\n  → %d filas · columnas: %s", "[describe] " if describir else "", sql.strip(),
+                        resultado.num_rows, ", ".join(f"{c.name} {c.type}" for c in resultado.schema))
         self.send_reader(resultado.to_reader(), callback)
 
     def _original(self, sql: str, describir: bool) -> str:
@@ -317,6 +323,9 @@ def main() -> None:
     parser.add_argument("--user", default=os.environ.get("SEMANTIC_GW_USER", "bi"))
     parser.add_argument("--password", default=os.environ.get("SEMANTIC_GW_PASSWORD", "bi"))
     parser.add_argument("--log-level", default=os.environ.get("SEMANTIC_GW_LOG_LEVEL", "INFO"))
+    parser.add_argument("--log-sql", action="store_true", default=os.environ.get("SEMANTIC_GW_LOG_SQL", "") == "1",
+                        help="muestra cada consulta que llega (catálogo incluido) y la forma de la respuesta; "
+                             "para diagnosticar clientes BI")
     parser.add_argument("--tls-cert", default=os.environ.get("SEMANTIC_GW_TLS_CERT"),
                         help="certificado PEM; con --tls-key activa TLS (los clientes usan sslmode=require)")
     parser.add_argument("--tls-key", default=os.environ.get("SEMANTIC_GW_TLS_KEY"))
@@ -339,6 +348,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s · %(message)s")
+    logger_sql.setLevel(logging.INFO if args.log_sql else logging.WARNING)
     ejecutores: dict[str, Ejecutor] = {}
     if args.ejecutar:
         ejecutores["athena"] = EjecutorAthena(ConfigAthena(
