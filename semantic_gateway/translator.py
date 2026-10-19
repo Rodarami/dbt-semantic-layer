@@ -62,6 +62,7 @@ class Translator:
             raise TranslationError(f"SQL no válido: {e}") from e
         if not isinstance(tree, exp.Select):
             raise TranslationError("Solo se admiten consultas SELECT sobre la tabla semántica")
+        tree = _aplanar(tree)
         table = self._check_shape(tree)
 
         sq = SemanticQuery()
@@ -216,6 +217,80 @@ class Translator:
         if name not in sq.metrics and name not in sq.group_by:
             raise TranslationError(f"ORDER BY '{name}': la columna debe estar en el SELECT")
         return name
+
+
+def _salida(proyeccion: exp.Expression) -> str:
+    """Nombre con que una columna sale de una consulta: su alias o el nombre de la columna."""
+    if isinstance(proyeccion, exp.Alias):
+        return proyeccion.alias.lower()
+    if isinstance(proyeccion, exp.Column):
+        return proyeccion.name.lower()
+    raise TranslationError(f"Expresión no soportada: {proyeccion.sql()} (use columnas de la tabla semántica)")
+
+
+def _aplanar(tree: exp.Select) -> exp.Select:
+    """Quita los envoltorios que agregan los BI alrededor de la consulta del usuario.
+
+    Power BI, con una instrucción SQL nativa, envía `select "_"."a", "_"."b" from (CONSULTA) "_" limit 1000` para la
+    vista previa y para leer las columnas. Si la consulta externa solo elige columnas de la interna, filtra, ordena o
+    limita, se reescribe como una sola consulta sobre la tabla semántica. Cualquier otra cosa (agregar, agrupar, joins)
+    se sigue rechazando como subconsulta.
+    """
+    while True:
+        origen = tree.args.get("from_") or tree.args.get("from")  # "from_" en sqlglot recientes
+        sub = origen.this if origen is not None else None
+        if not (isinstance(sub, exp.Subquery) and isinstance(sub.this, exp.Select)):
+            return tree
+        for arg in ("joins", "group", "having", "offset", "with", "distinct"):
+            if tree.args.get(arg):
+                return tree  # no es un simple envoltorio: _check_shape lo rechaza
+        interna = sub.this.copy()
+        por_nombre = {_salida(p): p for p in interna.expressions}
+
+        def interna_de(columna: exp.Column) -> exp.Expression:
+            nombre = columna.name.lower()
+            if nombre not in por_nombre:
+                raise TranslationError(f"Columna desconocida en la capa semántica: '{columna.name}'")
+            return por_nombre[nombre]
+
+        proyecciones = []
+        for p in tree.expressions:
+            if p.is_star:
+                proyecciones.extend(e.copy() for e in interna.expressions)
+                continue
+            nombre_salida = p.alias if isinstance(p, exp.Alias) else None
+            col = p.unalias()
+            if not isinstance(col, exp.Column):
+                return tree  # el envoltorio calcula algo (SUM, COUNT…): no se aplana
+            base = interna_de(col).unalias().copy()
+            nombre = nombre_salida or col.name
+            proyecciones.append(base if isinstance(base, exp.Column) and base.name == nombre
+                                else exp.alias_(base, nombre, quoted=True))
+        interna.set("expressions", proyecciones)
+
+        def a_interna(nodo: exp.Expression) -> exp.Expression:
+            if isinstance(nodo, exp.Column):
+                return interna_de(nodo).unalias().copy()
+            return nodo
+
+        donde = tree.args.get("where")
+        if donde is not None:
+            condicion = donde.this.transform(a_interna)
+            previa = interna.args.get("where")
+            interna.set("where", exp.Where(this=exp.and_(previa.this, condicion) if previa else condicion))
+        orden = tree.args.get("order")
+        if orden is not None:
+            interna.set("order", orden.transform(a_interna))
+        limite = tree.args.get("limit")
+        if limite is not None:
+            previo = interna.args.get("limit")
+            externo, interno = limite.args.get("expression"), previo.args.get("expression") if previo else None
+            if (isinstance(interno, exp.Literal) and isinstance(externo, exp.Literal)
+                    and int(interno.this) <= int(externo.this)):
+                pass  # el límite de adentro ya es menor
+            else:
+                interna.set("limit", limite.copy())
+        tree = interna
 
 
 def _canonico(name: str) -> str:

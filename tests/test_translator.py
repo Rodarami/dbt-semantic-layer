@@ -83,6 +83,34 @@ def test_each_table_translates_its_own_columns() -> None:
     assert not T.is_semantic("select 1 from dbt_glue_lab")
 
 
+def test_envoltorios_de_power_bi() -> None:
+    """Power BI envuelve la instrucción SQL nativa: select "_".col … from (CONSULTA) "_" limit 1000."""
+    nativa = "SELECT event__platform, item_views FROM semantic.events WHERE metric_time >= '2024-01-01'"
+    directa = T.translate(nativa)
+    for envuelta in (
+        f'select "_"."event__platform", "_"."item_views" from ({nativa}) "_" limit 1000',
+        f'select * from ({nativa}) as "$Table" limit 1000',
+        f'select * from (select "_"."event__platform", "_"."item_views" from ({nativa}) "_") "rows" limit 1000',
+    ):
+        sq = T.translate(envuelta)
+        assert (sq.metrics, sq.group_by, sq.start, sq.limit) == (directa.metrics, directa.group_by, directa.start, 1000)
+        assert sq.output == directa.output
+    sq = T.translate(f'select "_"."event__platform" as p from ({nativa}) "_" '
+                     f'where "_"."event__platform" <> \'web\' order by "_"."event__platform"')
+    assert sq.output == [("event__platform", "p")] and sq.order_by == ["event__platform"] and len(sq.where) == 1
+    for sql, msg in [  # lo que no es un simple envoltorio se sigue rechazando
+        (f'select sum("_"."item_views") from ({nativa}) "_"', "subconsultas"),
+        (f'select "_"."x" from ({nativa}) "_"', "desconocida"),
+        (f'select * from ({nativa}) "_" where "_"."item_views" > 3', "métrica"),
+    ]:
+        try:
+            T.translate(sql)
+        except TranslationError as e:
+            assert msg in str(e), (sql, str(e))
+        else:
+            raise AssertionError(f"Se esperaba error: {sql}")
+
+
 def test_rejections() -> None:
     for sql, msg in [
         ("SELECT * FROM events", "SELECT *"),
