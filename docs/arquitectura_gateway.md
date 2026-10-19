@@ -41,6 +41,13 @@ Cuando el cliente consulta una de esas tablas, el gateway:
 Todo lo demás que el cliente pregunta (qué tablas hay, qué columnas, tipos, versión del servidor) lo responde un
 **catálogo en memoria** en DuckDB, sin tocar el warehouse.
 
+![Arquitectura del gateway semántico](img/arquitectura_gateway_actual.png)
+
+El protocolo PostgreSQL lo resuelve **riffq** (núcleo en Rust): conexión, autenticación, TLS y los mensajes del
+protocolo. Cada consulta llega a Python, que decide quién la responde:
+
+![Quién responde cada consulta](img/gateway_rutas_riffq.png)
+
 ---
 
 ## 2. Diagrama de arquitectura
@@ -57,13 +64,13 @@ flowchart LR
     subgraph GW["Gateway semántico (python -m semantic_gateway)"]
         direction TB
         subgraph Serving["Serving layer"]
-            PG["Endpoint Postgres wire<br/>buenavista · MotorServer / MotorHandler<br/>auth MD5 · motor por dbname"]
-            RW["SemanticRewriter<br/>¿semántica o catálogo?<br/>compatibilidad JDBC"]
+            PG["Endpoint Postgres wire<br/>riffq (Rust · pgwire)<br/>TLS · auth · pool de hilos"]
+            RW["ConexionSemantica._resolver<br/>¿semántica o catálogo?<br/>catalogo_pg.reescribir"]
             TR["Translator<br/>SQL → SemanticQuery<br/>(sqlglot)"]
             CAT[("Catálogo DuckDB<br/>information_schema · pg_catalog<br/>semantic.* (tablas vacías)<br/>semantic.metrics / dimensions")]
         end
         subgraph Gate["Gateway (orquestación)"]
-            SS["SemanticSession.execute_sql<br/>enruta · log · ordena columnas"]
+            SS["ConexionSemantica._semantica<br/>enruta · log · ordena columnas"]
             EX["EjecutorAthena<br/>PyAthena · timeout · max_filas"]
         end
         subgraph Engine["Metric engine"]
@@ -114,12 +121,11 @@ Lectura del diagrama:
 
 | Pieza | Archivo | Capa del ADR | Qué hace |
 | --- | --- | --- | --- |
-| `MotorServer` | `server.py` | Serving | Servidor TCP de buenavista. Acepta conexiones y abre **un hilo por conexión** |
-| `MotorHandler` | `server.py` | Serving | Maneja el protocolo de una conexión: arranque, autenticación MD5, mensajes de consulta. Fija el motor de la sesión según `dbname` |
-| `BVContext` | buenavista | Serving | Estado de una conexión: sentencias preparadas, portales y caché de resultados del protocolo extendido |
-| `SemanticRewriter` | `server.py` | Serving | Primer filtro de cada consulta: deja pasar intactas las semánticas y adapta las de catálogo al dialecto de DuckDB |
-| Catálogo DuckDB | `server.py` (`install_catalog`) | Serving | Base DuckDB en memoria con `information_schema`, `pg_catalog`, las tablas virtuales vacías y las tablas `semantic.metrics`, `dimensions`, `metric_dimensions` |
-| `SemanticSession` | `server.py` | Gateway | Sesión de una conexión. `execute_sql` decide la ruta: catálogo, SQL compilado o ejecución en Athena |
+| riffq (`RiffqServer`) | librería (Rust + Python) | Serving | Servidor del protocolo PostgreSQL (simple y extendido) escrito en Rust sobre `pgwire`. Acepta conexiones, TLS opcional, y entrega cada consulta a Python. Responde por sí solo la consulta vacía, `DISCARD ALL` y algunos `SHOW` al ejecutar |
+| `ConexionSemantica` | `server.py` | Serving | Una instancia por cliente. `handle_auth` valida usuario y clave y fija el motor según `dbname`; `handle_query` recibe cada consulta y la atiende en un pool de hilos |
+| `_resolver` + `catalogo_pg.reescribir` | `server.py`, `catalogo_pg.py` | Serving | Primer filtro de cada consulta: las semánticas van al traductor; las de catálogo se adaptan al dialecto de DuckDB |
+| Catálogo DuckDB | `catalogo_pg.py` (`install_catalog`) | Serving | Base DuckDB en memoria con `information_schema`, `pg_catalog`, las tablas virtuales vacías y las tablas `semantic.metrics`, `dimensions`, `metric_dimensions` |
+| `_semantica` | `server.py` | Gateway | Ruta semántica: describe (solo el esquema), SQL compilado o ejecución en Athena |
 | `Translator` | `translator.py` | Serving | Convierte el `SELECT` del cliente en un `SemanticQuery`, validando el contrato |
 | `SemanticQuery` | `model.py` | Contrato | La consulta semántica: métricas, `group_by`, filtros, rango de tiempo, orden, límite y columnas de salida |
 | `SemanticEngine` | `engine.py` | Metric engine | Carga el manifest, arma el catálogo y compila con MetricFlow al dialecto pedido |
@@ -146,8 +152,8 @@ flowchart TB
     F --> G["engine.catalog('semantic')<br/>métricas, dimensiones, una tabla por modelo"]
     G --> H["duckdb.connect() + install_catalog()<br/>crea tablas vacías, comentarios, vistas pg_* y macros gw_*"]
     H --> I["Translator(catalog)"]
-    I --> J["MotorServer(SemanticConnection, SemanticRewriter, auth)"]
-    J --> K["serve_forever()<br/>'Gateway listo en 127.0.0.1:5433 …'"]
+    I --> J["RiffqServer(ConexionSemantica)<br/>pool de 32 hilos · TLS si hay certificado"]
+    J --> K["start()<br/>'Gateway listo en 127.0.0.1:5433 (riffq) …'"]
 ```
 
 🔍 [Abrir en el visor con zoom](arquitectura_gateway.html#02_arranque)
@@ -157,7 +163,7 @@ Qué queda en memoria después de arrancar:
 | Objeto | Contenido | Se comparte entre conexiones |
 | --- | --- | --- |
 | `SemanticEngine` | El manifest parseado y un `MetricFlowEngine` por motor (se crea la primera vez que se pide ese motor) | Sí, con candado para compilar |
-| `Catalog` | Métricas, dimensiones y tablas virtuales (`events`, `items`, `top_items`…) | Sí, solo lectura |
+| `Catalog` | Métricas, dimensiones y tablas virtuales (una por modelo semántico con métricas del manifest) | Sí, solo lectura |
 | Base DuckDB | El catálogo SQL que ven los clientes | Sí; cada conexión abre su propio cursor |
 | `Translator` | Reglas del contrato SQL sobre ese catálogo | Sí, sin estado |
 | Ejecutores | `{"athena": EjecutorAthena}` si se usó `--ejecutar` | Sí; un cursor de Athena por consulta |
@@ -184,30 +190,30 @@ El manifest se lee **una sola vez**. Si cambia, hay que reiniciar el gateway.
 sequenceDiagram
     autonumber
     participant C as Cliente BI
-    participant H as MotorHandler
-    participant S as SemanticSession
-    C->>H: StartupMessage (user=bi, database=athena)
-    H->>C: AuthenticationMD5Password (salt)
-    C->>H: PasswordMessage (md5 de bi/bi)
-    H->>H: valida la clave
-    H->>S: SemanticConnection.new_session()<br/>cursor DuckDB con search_path = semantic, main
-    H->>H: handle_startup → motor_from_database("athena")
-    Note over H,S: session.motor = "athena"<br/>dbname vacío, semantic o igual al usuario → motor por defecto<br/>dbname desconocido → error en la primera consulta semántica
-    H->>C: ParameterStatus (server_version=14.0, client_encoding=UTF8, DateStyle=ISO)
-    H->>C: ReadyForQuery
+    participant R as riffq (Rust)
+    participant P as ConexionSemantica (Python)
+    C->>R: StartupMessage (user=bi, database=athena) · TLS si está activo
+    R->>C: AuthenticationCleartextPassword
+    C->>R: PasswordMessage
+    R->>P: handle_auth(bi, clave, host, database="athena")
+    P->>P: valida usuario y clave · motor_from_database("athena")
+    Note over R,P: motor = "athena"<br/>dbname vacío, semantic o igual al usuario → motor por defecto<br/>dbname desconocido → error en la primera consulta semántica
+    P-->>R: callback(True)
+    R->>C: AuthenticationOk · ParameterStatus (server_version=14.0…) · ReadyForQuery
 ```
 
 🔍 [Abrir en el visor con zoom](arquitectura_gateway.html#03_conexion)
 
-Cada conexión tiene su propia `SemanticSession` y su propio motor. Una conexión con `dbname=athena` y otra con
+Cada conexión tiene su propia `ConexionSemantica` y su propio motor. Una conexión con `dbname=athena` y otra con
 `dbname=snowflake` pueden convivir: la primera recibe filas de Athena y la segunda, SQL de Snowflake.
 
 ---
 
 ## 6. Flujo de una consulta, paso a paso
 
-Ejemplo que se sigue en toda la sección, enviado desde DBeaver con `dbname=athena` y el gateway levantado con
-`--ejecutar`:
+Ejemplo que se sigue en toda la sección, con el manifest de `dbt_glue_lab`, enviado desde DBeaver con
+`dbname=athena` y el gateway levantado con `--ejecutar` (con otro manifest el recorrido es el mismo; cambian la tabla
+y las columnas):
 
 ```sql
 SELECT event__platform AS plataforma, event_count
@@ -223,21 +229,21 @@ LIMIT 5
 sequenceDiagram
     autonumber
     participant C as Cliente (DBeaver)
-    participant H as MotorHandler / BVContext
-    participant R as SemanticRewriter
-    participant S as SemanticSession
+    participant R as riffq (Rust)
+    participant S as ConexionSemantica
     participant T as Translator
     participant M as SemanticEngine (MetricFlow)
     participant E as EjecutorAthena
     participant A as Athena
 
-    C->>H: Parse + Bind + Describe(portal) + Execute + Sync
-    H->>R: rewrite(sql)
-    R->>T: is_semantic(sql)?
-    T-->>R: sí (lee semantic.events)
-    R-->>H: sql intacto
-    H->>S: execute_sql(sql)
-    S->>S: split_explain · _es_sonda · parámetros · motor válido
+    C->>R: Parse + Bind + Describe(portal) + Execute + Sync
+    R->>S: handle_query(sql, do_describe=True)
+    S->>T: is_semantic · translate(sql)
+    T-->>S: SemanticQuery
+    S-->>R: tabla vacía con el esquema (no compila ni va a Athena)
+    R->>C: RowDescription (plataforma, event_count)
+    R->>S: handle_query(sql en minúsculas, do_describe=False)
+    S->>S: _original recupera el texto del describe
     S->>T: translate(sql, dialect="athena")
     T-->>S: SemanticQuery
     S->>M: explain(SemanticQuery, "athena")
@@ -250,11 +256,10 @@ sequenceDiagram
     end
     A-->>E: SUCCEEDED + resultado en S3
     E-->>S: Resultado (tabla Arrow, query_id, segundos, bytes)
-    S->>S: ordenar_columnas · log "Ejecutada en athena"
-    S-->>H: DuckDBQueryResult
-    H->>C: RowDescription (plataforma, event_count)
-    H->>C: DataRow × N
-    H->>C: CommandComplete "SELECT N" + ReadyForQuery
+    S->>S: ordenar_columnas · _ajustar_tipos · log "Ejecutada en athena"
+    S-->>R: tabla Arrow (callback)
+    R->>C: DataRow × N
+    R->>C: CommandComplete "SELECT N" + ReadyForQuery
 ```
 
 🔍 [Abrir en el visor con zoom](arquitectura_gateway.html#04_flujo_consulta)
@@ -263,47 +268,57 @@ sequenceDiagram
 
 Hay dos formas de enviar una consulta en el protocolo PostgreSQL, y el gateway acepta ambas:
 
-| Protocolo | Lo usan | Mensajes | Dónde entra en el gateway |
+| Protocolo | Lo usan | Mensajes | Qué llega a Python |
 | --- | --- | --- | --- |
-| Simple | psql, algunos pings | `Query` | `MotorHandler.handle_query` |
-| Extendido | JDBC (DBeaver, Metabase), psycopg | `Parse` → `Bind` → `Describe` → `Execute` → `Sync` | `handle_parse`, `handle_bind`, `handle_describe`, `handle_execute` (buenavista) |
+| Simple | psql, psycopg sin parámetros | `Query` | Una llamada a `handle_query` con el SQL tal cual |
+| Extendido | JDBC (DBeaver, Metabase), Npgsql (Power BI), psycopg con parámetros | `Parse` → `Bind` → `Describe` → `Execute` → `Sync` | Dos llamadas: `do_describe=True` (solo la forma del resultado) y luego la ejecución |
 
-En el protocolo extendido, `Describe` del portal **ejecuta** la consulta para conocer sus columnas y guarda el
-resultado en `BVContext.result_cache`. El `Execute` siguiente envía las filas de esa caché, así que la consulta va a
-Athena **una sola vez**.
+riffq resuelve todo el protocolo en Rust. En el extendido pide primero el esquema del resultado y después las filas.
+El gateway aprovecha esa separación:
 
-`MotorHandler.handle_query` intercepta además el caso de una consulta vacía (`;`), que los drivers JDBC usan como
-ping, y responde `EmptyQueryResponse` sin pasar por el resto.
+- **Describe:** `_semantica` traduce la consulta y devuelve una tabla vacía con los tipos del catálogo. No compila
+  con MetricFlow ni va a Athena, así que la consulta se ejecuta **una sola vez**.
+- **Execute:** riffq entrega el SQL **en minúsculas**. `_original` recupera el texto guardado en el describe, para que
+  un filtro como `WHERE employee__gender = 'F'` no se convierta en `'f'`.
 
-### 6.3 Paso 2 — `SemanticRewriter.rewrite`: ¿semántica o catálogo?
+La consulta vacía (`;`, ping de los drivers JDBC), `DISCARD ALL` y `SHOW TRANSACTION ISOLATION LEVEL` los responde
+riffq sin llamar a Python. Los parámetros los decodifica riffq; los de texto sin tipo llegan como `NULL` (JDBC y
+Npgsql siempre envían el tipo).
 
-Toda consulta pasa primero por el rewriter. Su trabajo es separar las consultas semánticas, que pasan **intactas**,
-de las de catálogo, que se adaptan para que DuckDB las entienda.
+### 6.3 Paso 2 — `_resolver` y `catalogo_pg.reescribir`: ¿semántica o catálogo?
+
+`_resolver` separa las consultas semánticas, que van **intactas** al traductor, de las de catálogo, que
+`catalogo_pg.reescribir` adapta para que DuckDB las entienda.
 
 ```mermaid
 flowchart TB
-    Q["SQL del cliente"] --> S{"translator.is_semantic?<br/>(lee alguna tabla de semantic.*)"}
-    S -- sí --> P["pasa intacta → SemanticSession"]
-    S -- no --> V{"¿vacía o solo comentarios?"}
-    V -- sí --> V1["SELECT 1 WHERE FALSE"]
-    V -- no --> VER{"¿version()?"}
-    VER -- sí --> VER1["'PostgreSQL 14.0 (gateway semántico…)'"]
-    VER -- no --> BEG{"¿BEGIN / START TRANSACTION …?"}
-    BEG -- sí --> BEG1["BEGIN"]
-    BEG -- no --> PK{"¿_pg_expandarray?<br/>(claves primarias de JDBC)"}
-    PK -- sí --> PK1["resultado vacío con las columnas de JDBC"]
-    PK -- no --> TZ{"¿SHOW TIMEZONE?"}
-    TZ -- sí --> TZ1["SELECT 'UTC'"]
-    TZ -- no --> AR["'{a,b}'::text[] → ['a','b']"]
+    Q["SQL del cliente<br/>(texto original recuperado)"] --> V{"¿vacía o solo comentarios?"}
+    V -- sí --> V1["etiqueta vacía"]
+    V -- no --> CTL{"¿BEGIN / COMMIT / SET / RESET / DISCARD…?"}
+    CTL -- sí --> CTL1["etiqueta sin efecto"]
+    CTL -- no --> SH{"¿SHOW …?"}
+    SH -- sí --> SH1["valor fijo (_show)"]
+    SH -- no --> S{"translator.is_semantic?<br/>(lee alguna tabla virtual)"}
+    S -- sí --> P["_semantica (paso 3)"]
+    S -- no --> RW["catalogo_pg.reescribir"]
+    RW --> VER{"¿version()? ¿tipos de Npgsql? ¿_pg_expandarray?"}
+    VER -- sí --> FIJO["respuesta fija"]
+    VER -- no --> AR["'{a,b}'::text[] → ['a','b']"]
     AR --> AST{"¿sqlglot la analiza?"}
     AST -- sí --> AST1["_compat_catalogo sobre el árbol"]
     AST -- no --> RX["_compat_catalogo_texto (expresiones regulares)"]
-    AST1 --> BV["Rewriter de buenavista<br/>(Postgres → DuckDB)"]
-    RX --> BV
-    BV --> DK["DuckDB (catálogo)"]
+    AST1 --> TR["sqlglot: dialecto Postgres → DuckDB"]
+    RX --> TR
+    FIJO --> DK
+    TR --> DK["DuckDB (catálogo)"]
 ```
 
 🔍 [Abrir en el visor con zoom](arquitectura_gateway.html#05_rewriter)
+
+riffq trae su propio catálogo emulado (`pg_catalog` en Rust con DataFusion), pero resuelve solo 20 de las 25 consultas
+de catálogo de DBeaver, Power BI y Metabase: deja a DBeaver sin lista de esquemas ni de tablas y falla con
+`::regnamespace` de Metabase. Esas consultas no pasan por Python, así que no se pueden corregir. Por eso el gateway lo
+desactiva y usa su catálogo en DuckDB (prueba en [comparativa_protocolo.md](comparativa_protocolo.md), sección 5).
 
 `_compat_catalogo` adapta lo que los drivers piden y DuckDB no tiene:
 
@@ -314,29 +329,30 @@ flowchart TB
 | `pg_get_expr`, `pg_get_partkeydef`, `pg_relation_size`, `pg_get_keywords()`… | Macros propias `gw_*` en DuckDB |
 | `pg_type`, `pg_attribute`, `pg_database`, `pg_settings` | Vistas propias `gw_pg_*` con los OID y columnas que esperan los drivers |
 | `pg_trigger`, `pg_roles`, `pg_extension`, `pg_matviews`, `pg_stat_*` | Vistas vacías con las columnas esperadas |
+| `information_schema.*`, `pg_class`, `pg_namespace` | Vistas `gw_info_*`, `gw_pg_class`, `gw_pg_namespace` sin el esquema auxiliar `main` |
 
 En el ejemplo, la consulta lee `semantic.events`, así que pasa intacta.
 
-### 6.4 Paso 3 — `SemanticSession.execute_sql`: decidir la ruta
+### 6.4 Paso 3 — `_semantica`: decidir la ruta
 
 ```mermaid
 flowchart TB
-    A["execute_sql(sql, params)"] --> B["split_explain:<br/>¿empieza con EXPLAIN?"]
-    B --> C{"¿is_semantic?"}
-    C -- no --> CAT["DuckDB: catálogo"]
-    C -- sí --> D{"¿sonda?<br/>LIMIT 0 · WHERE 1&lt;&gt;1 · WHERE FALSE"}
+    A["_semantica(sql, describir, parámetros)"] --> B["split_explain:<br/>¿empieza con EXPLAIN?"]
+    B --> D{"¿sonda?<br/>LIMIT 0 · WHERE 1&lt;&gt;1 · WHERE FALSE"}
     D -- sí --> CAT2["DuckDB: tabla virtual vacía<br/>(el BI solo quiere la forma)"]
     D -- no --> E{"¿trae parámetros ($1)?"}
     E -- sí --> ERR1["Error: use literales"]
     E -- no --> F{"¿dbname válido?"}
     F -- no --> ERR2["Error: base de datos no existe"]
     F -- sí --> G["Translator.translate → SemanticQuery"]
-    G --> H["SemanticEngine.explain → SQL del motor"]
+    G --> DS{"¿describe?"}
+    DS -- sí --> DS1["tabla vacía con el esquema<br/>(columna sql, o las del SELECT con sus tipos)"]
+    DS -- no --> H["SemanticEngine.explain → SQL del motor"]
     H --> I["log: 'Consulta compilada' + SQL"]
     I --> J{"¿EXPLAIN o motor sin ejecutor?"}
     J -- sí --> K["devuelve 1 fila: columna sql"]
     J -- no --> L["EjecutorAthena.ejecutar(SQL)"]
-    L --> M["ordenar_columnas"]
+    L --> M["ordenar_columnas · _ajustar_tipos"]
     M --> N["log: 'Ejecutada en athena · …'"]
     N --> O["devuelve las filas"]
 ```
@@ -414,7 +430,7 @@ La tabla física (`lab_data_silver.silver_event`) sale del manifest, del `node_r
 ```mermaid
 sequenceDiagram
     autonumber
-    participant S as SemanticSession
+    participant S as ConexionSemantica._semantica
     participant E as EjecutorAthena
     participant T as Hilo athena-query
     participant A as Athena
@@ -462,11 +478,13 @@ Detalles:
    ```
    INFO … Ejecutada en athena · query_id=1a2b… · 5 filas · 3.8 s · 12.3 MB escaneados
    ```
-3. `SemanticSession` devuelve un `DuckDBQueryResult` armado sobre la tabla Arrow.
-4. buenavista traduce cada tipo Arrow a un tipo PostgreSQL y envía:
-   - `RowDescription`: nombres y tipos de columna;
-   - un `DataRow` por fila (si el cliente pidió un máximo por lote, envía `PortalSuspended` y continúa en el siguiente
-     `Execute`);
+3. `_ajustar_tipos` convierte cada columna al tipo que se informó en el describe (`DOUBLE` para métricas, `DATE` o
+   `VARCHAR` para dimensiones). Los clientes que leen en binario, como Npgsql (Power BI), interpretan los bytes según
+   ese tipo.
+4. La tabla Arrow vuelve a riffq por el `callback` (sin copias, con la interfaz PyCapsule de Arrow). riffq traduce
+   cada tipo Arrow a uno de PostgreSQL y envía:
+   - `RowDescription`, en el describe;
+   - un `DataRow` por fila;
    - `CommandComplete` (`SELECT 5`) y `ReadyForQuery`.
 
 Resultado en DBeaver:
@@ -484,9 +502,10 @@ Resultado en DBeaver:
 | --- | --- | --- | --- |
 | Catálogo | `SELECT * FROM information_schema.tables` | DuckDB | No |
 | Metadatos semánticos | `SELECT metric, description FROM semantic.metrics` | DuckDB (`semantic.metrics` tiene filas reales) | No |
-| Sonda del BI | `SELECT * FROM semantic.events WHERE 1<>1` o `LIMIT 0` | DuckDB: tabla virtual vacía | No |
-| Ping | `;` o solo un comentario | `EmptyQueryResponse` o `SELECT 1 WHERE FALSE` | No |
-| `EXPLAIN` semántico | `EXPLAIN SELECT event_count FROM semantic.events` | Traductor + MetricFlow: columna `sql` | No |
+| Sonda del BI | `SELECT * FROM semantic.<modelo> WHERE 1<>1` o `LIMIT 0` | DuckDB: tabla virtual vacía | No |
+| Ping | `;` o solo un comentario | riffq (`EmptyQueryResponse`) o etiqueta vacía | No |
+| Control de sesión | `BEGIN`, `SET …`, `DISCARD ALL`, `SHOW …` | riffq o `_resolver`, sin efecto | No |
+| `EXPLAIN` semántico | `EXPLAIN SELECT <métrica> FROM semantic.<modelo>` | Traductor + MetricFlow: columna `sql` | No |
 | Semántica, motor sin ejecutor | `dbname=snowflake` | Traductor + MetricFlow: columna `sql` | No |
 | Semántica, gateway sin `--ejecutar` | cualquier `dbname` | Traductor + MetricFlow: columna `sql` | No |
 | **Semántica con ejecutor** | `dbname=athena` y `--ejecutar` | Traductor + MetricFlow + Athena: **filas** | **Sí** |
@@ -495,8 +514,10 @@ Resultado en DBeaver:
 
 ## 8. Errores: dónde nacen y cómo llegan al cliente
 
-Cualquier excepción dentro de `execute_sql` la convierte buenavista en un `ErrorResponse` de PostgreSQL. El cliente
-lo muestra como un error SQL con el mensaje original.
+`_responder` captura cualquier excepción y la entrega a riffq con `callback((severidad, código, mensaje),
+is_error=True)`; riffq la envía como `ErrorResponse` de PostgreSQL. El cliente la muestra como un error SQL con el
+mensaje original. Tras un error en el protocolo extendido, riffq descarta los mensajes hasta el `Sync`, como un
+PostgreSQL real.
 
 | Dónde | Excepción | Ejemplos de mensaje |
 | --- | --- | --- |
@@ -505,6 +526,7 @@ lo muestra como un error SQL con el mensaje original.
 | MetricFlow | excepciones de MetricFlow | Combinaciones de métrica y dimensión que el grafo semántico no puede resolver |
 | Ejecutor | `ExecutionError` | `Athena: … AccessDenied …`, `TABLE_NOT_FOUND`, `La consulta superó el tiempo máximo de 100 s en Athena y se canceló` |
 | Catálogo | errores de DuckDB | Funciones de `pg_catalog` que todavía no tienen equivalente |
+| Autenticación | rechazo en `handle_auth` | `password authentication failed for user "…"` (código `28P01`) |
 
 Los errores del ejecutor quedan además en el log como `ERROR … Falló la ejecución en athena: …`.
 
@@ -514,22 +536,25 @@ Los errores del ejecutor quedan además en el log como `ERROR … Falló la ejec
 
 ```mermaid
 flowchart LR
-    C1["Conexión 1<br/>dbname=athena"] --> H1["Hilo 1<br/>SemanticSession"]
-    C2["Conexión 2<br/>dbname=snowflake"] --> H2["Hilo 2<br/>SemanticSession"]
-    C3["Conexión 3<br/>dbname=athena"] --> H3["Hilo 3<br/>SemanticSession"]
-    H1 & H2 & H3 --> L["SemanticEngine.explain<br/>(candado: compila de a una)"]
-    H1 --> X1["Hilo athena-query"]
-    H3 --> X3["Hilo athena-query"]
+    C1["Conexión 1<br/>dbname=athena"] --> R["riffq (Rust, asíncrono)<br/>una tarea por conexión"]
+    C2["Conexión 2<br/>dbname=snowflake"] --> R
+    C3["Conexión 3<br/>dbname=athena"] --> R
+    R --> POOL["Pool de 32 hilos de Python<br/>(_responder)"]
+    POOL --> L["SemanticEngine.explain<br/>(candado: compila de a una)"]
+    POOL --> X1["Hilo athena-query"]
+    POOL --> X3["Hilo athena-query"]
     X1 & X3 --> A[Athena]
-    H1 & H2 & H3 --> D[("DuckDB<br/>un cursor por sesión")]
+    POOL --> D[("DuckDB<br/>un cursor por consulta")]
 ```
 
 🔍 [Abrir en el visor con zoom](arquitectura_gateway.html#08_concurrencia)
 
-- buenavista abre **un hilo por conexión**. Cada uno tiene su sesión, su cursor de DuckDB y su motor.
+- riffq atiende las conexiones en Rust (asíncrono) y entrega cada consulta a un **pool de 32 hilos** de Python. Cada
+  conexión conserva su motor en su `ConexionSemantica`; cada consulta usa su propio cursor de DuckDB.
 - La compilación con MetricFlow tarda milisegundos y se hace de a una.
 - Las ejecuciones en Athena sí corren en paralelo: cada consulta usa su propio cursor y su propio hilo.
-- Una consulta lenta solo bloquea a su conexión; las demás siguen respondiendo.
+- Una consulta lenta ocupa un hilo del pool; las demás conexiones siguen respondiendo.
+- Con Ctrl+C riffq deja de aceptar conexiones y el proceso termina aunque haya clientes conectados.
 
 ---
 
@@ -541,8 +566,8 @@ El ADR define la ruta única de una consulta en siete pasos:
 
 | # | Paso del ADR | Implementación | Estado |
 | --- | --- | --- | --- |
-| 1 | La presentation layer envía una petición al serving layer | Endpoint Postgres wire (`MotorServer`/`MotorHandler`), probado con DBeaver, Metabase, psql y Python | ✅ Cubierto |
-| 2 | El serving layer autentica al consumidor y traduce la petición a una consulta semántica | Autenticación MD5 con un usuario fijo; traducción completa con `Translator` → `SemanticQuery` | 🟡 Traducción cubierta; autenticación mínima |
+| 1 | La presentation layer envía una petición al serving layer | Endpoint Postgres wire sobre riffq (núcleo Rust con `pgwire`), probado con DBeaver, Metabase, psql y Python; Power BI en prueba | ✅ Cubierto |
+| 2 | El serving layer autentica al consumidor y traduce la petición a una consulta semántica | Usuario y clave fijos en `handle_auth` (punto de extensión para el IdP) y TLS opcional u obligatorio (`--tls-obligatorio`); traducción completa con `Translator` → `SemanticQuery` | 🟡 Traducción cubierta; autenticación mínima |
 | 3 | El gateway autoriza, añade los filtros de seguridad (RLS, objeto, PII) y comprueba la caché | No hay autorización, RLS, PII ni caché | ❌ Pendiente |
 | 4 | El gateway entrega la consulta al metric engine; MetricFlow la compila a SQL | `SemanticEngine.explain` con MetricFlow OSS embebido, solo compila | ✅ Cubierto |
 | 5 | El gateway ejecuta el SQL en el compute engine con sus propios conectores (identidad, costo, auditoría) | `EjecutorAthena` con PyAthena, `timeout` que cancela en Athena y log de bytes escaneados. Solo Athena; una credencial para todos | 🟡 Parcial |
@@ -554,10 +579,10 @@ El ADR define la ruta única de una consulta en siete pasos:
 | Capa | Componente del ADR | Implementación | Estado |
 | --- | --- | --- | --- |
 | Semantic models | Definición de métricas en dbt, `semantic_manifest.json` | YAML de dbt 1.12, `dbt parse`, manifests en `semantic_manifests/` | ✅ Cubierto |
-| Serving | Endpoint Postgres wire | buenavista + catálogo DuckDB; compatibilidad JDBC para DBeaver y Metabase | ✅ Cubierto (PoC) |
+| Serving | Endpoint Postgres wire | riffq + catálogo DuckDB (`catalogo_pg.py`); compatibilidad con DBeaver, Metabase y Npgsql. `server_old.py` (buenavista) como respaldo | ✅ Cubierto (PoC) |
 | Serving | Traductor de peticiones (sqlglot) | `translator.py`, contrato `SemanticQuery` | ✅ Cubierto |
 | Serving | Exponer el catálogo de métricas y dimensiones | Una tabla virtual por modelo semántico; `semantic.metrics`, `dimensions`, `metric_dimensions` | ✅ Cubierto |
-| Serving | Autenticación OIDC/SAML, Entra ID | Usuario y clave MD5 fijos (`bi`/`bi`) | 🟡 Mínimo |
+| Serving | Autenticación OIDC/SAML, Entra ID | Usuario y clave fijos (`bi`/`bi`) en `handle_auth`; TLS con `--tls-cert`/`--tls-key`, obligatorio con `--tls-obligatorio` | 🟡 Mínimo |
 | Serving | API REST/GraphQL | — | ❌ Pendiente |
 | Serving | Servidor MCP (agentes IA) | — | ❌ Pendiente |
 | Serving | Arrow Flight SQL, XMLA/DAX | — (el ADR los deja para después del MVP) | ⏸ Fuera del MVP |
@@ -599,17 +624,17 @@ El ADR define la ruta única de una consulta en siete pasos:
 
 | Paso del flujo | Archivo | Función o clase |
 | --- | --- | --- |
-| Arranque | `server.py` | `main`, `build_server`, `install_catalog`, `_install_pg_views` |
+| Arranque | `server.py`, `catalogo_pg.py` | `main`, `build_server`, `install_catalog`, `_install_pg_views` |
 | Catálogo semántico | `engine.py` | `SemanticEngine.catalog`, `_tables` |
-| Conexión y motor | `server.py` | `MotorHandler.handle_startup`, `motor_from_database`, `SemanticConnection.new_session` |
-| Ping y consulta simple | `server.py` | `MotorHandler.handle_query`, `_consulta_vacia` |
-| Clasificación y compatibilidad | `server.py` | `SemanticRewriter.rewrite`, `_compat_catalogo`, `_compat_catalogo_texto`, `_literales_arreglo` |
-| Enrutamiento | `server.py` | `SemanticSession.execute_sql`, `_es_sonda` |
+| Protocolo, TLS y conexión | riffq, `server.py`, `tls_obligatorio.py` | `RiffqServer`, `PuertaTLS`, `ConexionSemantica.handle_auth`, `motor_from_database` |
+| Consulta | `server.py` | `ConexionSemantica.handle_query`, `_responder`, `_original`, `_resolver` |
+| Catálogo y compatibilidad | `catalogo_pg.py` | `reescribir`, `_compat_catalogo`, `_compat_catalogo_texto`, `_consulta_npgsql`, `_literales_arreglo` |
+| Enrutamiento semántico | `server.py` | `_semantica`, `_es_sonda`, `_esquema` |
 | Traducción | `translator.py` | `Translator.is_semantic`, `translate`, `_check_shape`, `_where`, `_time_constraint`, `_metricflow_filter`, `_order_name` |
 | Contrato | `model.py` | `SemanticQuery`, `Catalog`, `TableInfo` |
 | Compilación | `engine.py` | `SemanticEngine.explain`, `_request`, `ClienteSqlSoloDialecto` |
 | Ejecución | `executor.py` | `EjecutorAthena.ejecutar`, `ConfigAthena`, `Resultado`, `ExecutionError` |
-| Entrega | `executor.py`, buenavista | `ordenar_columnas`, `DuckDBQueryResult`, `send_row_description`, `send_data_rows` |
+| Entrega | `executor.py`, `server.py`, riffq | `ordenar_columnas`, `_ajustar_tipos`, `send_reader` (callback de riffq) |
 
 La referencia completa de cada función, con quién la llama, está en
 [gateway_semantico.md, sección 19](gateway_semantico.md#19-referencia-de-funciones).

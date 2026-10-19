@@ -121,9 +121,10 @@ dbt run -s metricflow_time_spine
 
 ## 4. Consultas para DBeaver
 
-Se ejecutan en un *SQL Editor* sobre la conexión del gateway. Las de la tabla semántica devuelven **una fila con
-la columna `sql`**: la consulta lista para ejecutar en Athena. La descripción indica qué resultado da ese SQL al
-ejecutarlo en Athena.
+Se ejecutan en un *SQL Editor* sobre la conexión del gateway. Con el gateway levantado con `--ejecutar`, las de la
+tabla semántica devuelven **las filas de Athena**; sin esa opción devuelven una fila con la columna `sql` (la
+consulta lista para ejecutar en Athena). La guía completa, con 23 consultas descritas, está en
+[docs/consultas_it_people.md](../../docs/consultas_it_people.md).
 
 ### Catálogo
 

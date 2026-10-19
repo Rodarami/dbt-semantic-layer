@@ -23,3 +23,8 @@ __pycache__/
 
 # Copias de seguridad locales
 backup/
+
+# certificados y claves TLS (nunca al repo)
+*.crt
+*.key
+*.pem

@@ -4,6 +4,9 @@ Manifest: `semantic_manifests/dbt_glue_lab/semantic_manifest.json`
 
 Proyecto `DBT/dbt_glue_lab`: eventos de la aplicación (vistas de items y de perfiles) y catálogo de items, sobre tablas Iceberg en Glue (`lab_data_silver`).
 
+Este archivo muestra el SQL de Athena que genera cada consulta. La guía completa de consultas para este manifest, con
+descripción de cada una, está en [docs/consultas_dbt_glue_lab.md](../../docs/consultas_dbt_glue_lab.md).
+
 ## Cómo usarlas
 
 1. Levantar el gateway con este manifest, desde la raíz `MetricFlow/`:
@@ -15,7 +18,7 @@ Proyecto `DBT/dbt_glue_lab`: eventos de la aplicación (vistas de items y de per
 2. En DBeaver, conexión PostgreSQL: host `127.0.0.1`, puerto `5433` (o el de `--port`), base de datos `athena`, usuario y contraseña `bi`, SSL desactivado.
 3. Abrir un *SQL Editor* sobre la conexión y ejecutar las consultas.
 
-Las consultas del catálogo devuelven filas. Las consultas de métricas devuelven **una fila con la columna `sql`**: la traducción para Athena que se muestra en cada ejemplo. En cada consulta, «Resultado» explica qué devuelve ese SQL al ejecutarlo en Athena. Los alias numerados (`subq_4`, `…_src_10000`) cambian entre ejecuciones.
+Las consultas del catálogo devuelven filas. Con el gateway levantado así (sin `--ejecutar`), las consultas de métricas devuelven **una fila con la columna `sql`**: la traducción para Athena que se muestra en cada ejemplo. En cada consulta, «Resultado» explica qué devuelve ese SQL al ejecutarlo en Athena. Los alias numerados (`subq_4`, `…_src_10000`) cambian entre ejecuciones.
 
 ## Qué publica
 

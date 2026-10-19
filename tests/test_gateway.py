@@ -1,17 +1,26 @@
 """Prueba de integración por protocolo Postgres: un solo servidor, el motor se elige en la conexión (dbname).
 
-Uso (desde la raíz del proyecto dbt):  python -m tests.test_gateway [ruta/semantic_manifest.json]
+Uso (desde la raíz del repo):  python -m tests.test_gateway [ruta/semantic_manifest.json]
+Servidor anterior (buenavista):  SEMANTIC_GW_SERVER=old python -m tests.test_gateway
 """
 
 from __future__ import annotations
 
+import importlib
+import os
 import re
 import socket
 import sys
 
 import psycopg
+from psycopg.types.string import StrDumper
 
-from semantic_gateway.server import start_in_thread
+# Parámetros de texto con tipo, como los envían JDBC (DBeaver, Metabase) y Npgsql (Power BI). Por defecto psycopg los
+# manda sin tipo y riffq los entrega como NULL.
+psycopg.adapters.register_dumper(str, StrDumper)
+
+_SERVIDOR = "server_old" if os.environ.get("SEMANTIC_GW_SERVER") == "old" else "server"
+start_in_thread = importlib.import_module(f"semantic_gateway.{_SERVIDOR}").start_in_thread
 
 QUERY = ("SELECT event__platform, MEASURE(item_views) AS vistas FROM semantic.events "
          "WHERE event__platform IN ('ios','android') AND metric_time >= DATE '2024-01-01' GROUP BY 1 ORDER BY 1")
@@ -78,7 +87,7 @@ def main(manifest: str) -> None:
                 c.execute(";")
                 c.execute("")
                 assert c.execute("SHOW TRANSACTION ISOLATION LEVEL").fetchone()[0] == "read committed"
-                assert c.execute("SELECT %s::text", ("a",)).fetchone()[0] == "a"
+                assert c.execute("SELECT %s::int", (5,)).fetchone()[0] == 5   # parámetro tipado (JDBC los tipa)
                 assert c.execute("SELECT count(*) FROM information_schema.tables WHERE table_schema = %s",
                                  ("semantic",)).fetchone()[0] == 5
                 assert c.execute("SELECT 1").fetchone()[0] == 1  # la conexión sigue viva tras todo lo anterior
@@ -188,6 +197,9 @@ def main(manifest: str) -> None:
     print("OK · gateway Postgres wire: motor por conexión")
     probar_ejecucion(manifest)
     probar_npgsql(manifest)
+    probar_seguridad(manifest)
+    if _SERVIDOR == "server":  # TLS solo existe en el servidor actual (riffq)
+        probar_tls_obligatorio(manifest)
 
 
 def probar_npgsql(manifest: str) -> None:
@@ -222,11 +234,15 @@ def probar_npgsql(manifest: str) -> None:
 
         cuerpo = struct.pack("!i", 196608) + b"user\0bi\0database\0athena\0\0"
         sock.sendall(struct.pack("!i", len(cuerpo) + 4) + cuerpo)
-        sal = leer()[1][4:8]
-        clave = hashlib.md5(hashlib.md5(b"bibi").hexdigest().encode() + sal).hexdigest()
-        sock.sendall(mensaje(b"p", b"md5" + clave.encode() + b"\0"))
-        while leer()[0] != b"Z":
-            pass
+        while True:  # autenticación: texto plano (riffq) o MD5 (buenavista)
+            tipo, datos = leer()
+            if tipo == b"R" and datos[:4] == struct.pack("!i", 3):
+                sock.sendall(mensaje(b"p", b"bi\0"))
+            elif tipo == b"R" and datos[:4] == struct.pack("!i", 5):
+                clave = hashlib.md5(hashlib.md5(b"bibi").hexdigest().encode() + datos[4:8]).hexdigest()
+                sock.sendall(mensaje(b"p", b"md5" + clave.encode() + b"\0"))
+            elif tipo == b"Z":
+                break
 
         def lote(consultas):
             salida = b""
@@ -248,9 +264,110 @@ def probar_npgsql(manifest: str) -> None:
         assert lote(["SELECT x FROM tabla_que_no_existe", enums]) == "12EZ"      # tras el error: nada hasta Sync
         assert "E" not in lote(["DISCARD ALL", "RESET ALL", "DEALLOCATE ALL", "UNLISTEN *"])  # limpieza del pool
         sock.close()
+        with _connect(port, "athena") as c:  # el navegador de Power BI no debe mostrar las vistas auxiliares (main)
+            esquemas = {r[0] for r in c.execute("select TABLE_SCHEMA from INFORMATION_SCHEMA.tables").fetchall()}
+            assert "main" not in esquemas and "semantic" in esquemas, esquemas
+            if _SERVIDOR == "server":  # Metabase sincroniza leyendo pg_class/pg_namespace (solo el servidor actual)
+                esquemas = {r[0] for r in c.execute(
+                    "SELECT n.nspname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n "
+                    "ON c.relnamespace = n.oid WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'").fetchall()}
+                assert esquemas == {"semantic"}, esquemas
     finally:
         server.shutdown()
     print("OK · Npgsql (Power BI): tipos al conectar y error a mitad de lote")
+
+
+def probar_seguridad(manifest: str) -> None:
+    """Un usuario autenticado no puede tocar archivos de la máquina, alterar el catálogo ni inyectar SQL en el motor."""
+    import tempfile
+    secreto = tempfile.NamedTemporaryFile("w", suffix=".env", delete=False)
+    secreto.write("CLAVE=no-debe-salir\n")
+    secreto.close()
+    salida = secreto.name + ".copia.csv"
+    port = _free_port()
+    server = start_in_thread("127.0.0.1", port, "bi", "bi", manifest, "athena")
+    ataques = [
+        f"SELECT content FROM read_text('{secreto.name}')",            # leer un archivo
+        f"SELECT * FROM glob('{os.path.dirname(secreto.name)}/*')",    # listar una carpeta
+        f"COPY (SELECT 1 AS x) TO '{salida}'",                         # escribir un archivo
+        f"SELECT 1; COPY (SELECT 1 AS x) TO '{salida}'",               # segunda sentencia escondida
+        f"ATTACH '{salida}.db' AS otra",                               # abrir otra base
+        "LOAD httpfs",                                                 # extensiones
+        "DROP VIEW main.gw_pg_settings",                               # romper el catálogo compartido
+        "CREATE TABLE main.basura AS SELECT 1 AS x",
+    ]
+    try:
+        with _connect(port, "athena") as c:
+            for sql in ataques:
+                try:
+                    c.execute(sql)
+                    raise AssertionError(f"debía rechazarse: {sql}")
+                except psycopg.Error:
+                    pass
+            assert not os.path.exists(salida) and not os.path.exists(salida + ".db")
+            assert c.execute("SELECT count(*) FROM pg_settings").fetchone()[0] > 0  # el catálogo sigue intacto
+            for valor in ("{{ 7*7 }}", "{%- if true %}x{% endif %}", "{# comentario #}",
+                          '{{ "%c"|format(39) }} OR 1=1 OR {{ "%c"|format(39) }}'):  # Jinja de MetricFlow
+                try:
+                    c.execute("SELECT event__platform, event_count FROM semantic.events WHERE event__platform = '"
+                              + valor.replace("'", "''") + "'")
+                    raise AssertionError(f"debía rechazarse el filtro {valor!r}")
+                except psycopg.Error as e:
+                    assert "no pueden contener" in str(e), e
+            sql = c.execute("SELECT event__platform, event_count FROM semantic.events "
+                            "WHERE event__platform = 'x'' OR ''1''=''1'").fetchone()[0]
+            assert "= 'x'' OR ''1''=''1'" in sql, sql                               # la comilla queda escapada
+    finally:
+        server.shutdown()
+        os.unlink(secreto.name)
+    print("OK · seguridad: sin acceso a archivos, catálogo de solo lectura y sin inyección por Jinja")
+
+
+def probar_tls_obligatorio(manifest: str) -> None:
+    """--tls-obligatorio: sin SSL la conexión se rechaza con 28000; con SSL todo funciona igual."""
+    import shutil
+    import subprocess
+    import tempfile
+    import threading
+    import time
+    from semantic_gateway.server import build_server
+
+    openssl = shutil.which("openssl")
+    if not openssl:
+        print("-- TLS obligatorio: se omite (no se encontró openssl para generar un certificado de prueba)")
+        return
+    carpeta = tempfile.mkdtemp()
+    crt, key = os.path.join(carpeta, "server.crt"), os.path.join(carpeta, "server.key")
+    subprocess.run([openssl, "req", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-x509", "-days", "1",
+                    "-out", crt, "-subj", "/CN=localhost"], check=True, capture_output=True)
+    try:
+        build_server("127.0.0.1", _free_port(), "bi", "bi", manifest, "athena", tls_obligatorio=True)
+        raise AssertionError("--tls-obligatorio sin certificado debía fallar")
+    except ValueError:
+        pass
+    port = _free_port()
+    gateway = build_server("127.0.0.1", port, "bi", "bi", manifest, "athena", tls_cert=crt, tls_key=key,
+                           tls_obligatorio=True)
+    threading.Thread(target=gateway.start, daemon=True).start()
+    for _ in range(100):
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                break
+        time.sleep(0.1)
+    base = f"host=127.0.0.1 port={port} user=bi password=bi dbname=athena"
+    try:
+        psycopg.connect(base + " sslmode=disable")
+        raise AssertionError("una conexión sin SSL debía rechazarse")
+    except psycopg.OperationalError as e:
+        assert "exige SSL" in str(e), e
+    for modo in ("prefer", "require"):  # prefer: libpq intenta SSL primero, así que también entra cifrado
+        with psycopg.connect(f"{base} sslmode={modo}", autocommit=True) as c:
+            assert c.pgconn.ssl_in_use
+            assert c.execute("SELECT count(*) FROM semantic.metrics").fetchone()[0] >= 10   # catálogo
+            assert "SELECT" in c.execute(QUERY).fetchone()[0]                                # consulta semántica
+        with psycopg.connect(f"{base} sslmode={modo}", autocommit=True, prepare_threshold=0) as c:
+            assert c.execute("SELECT %s::int", (5,)).fetchone() == (5,)                     # protocolo extendido
+    print("OK · TLS obligatorio: sin SSL se rechaza, con SSL funciona")
 
 
 class _EjecutorFalso:
@@ -263,8 +380,12 @@ class _EjecutorFalso:
     def ejecutar(self, sql: str):
         import pyarrow as pa
         from semantic_gateway.executor import Resultado
+        import datetime as dt
         self.sql.append(sql)
-        tabla = pa.table({"event__platform": ["ios", "android"], "event_count": [10, 20]})
+        if "event__event_date__day" in sql:  # dimensión de tiempo sin grano: MetricFlow le agrega __day
+            tabla = pa.table({"event__event_date__day": [dt.date(2024, 1, 1)], "event_count": [7]})
+        else:
+            tabla = pa.table({"event__platform": ["ios", "android"], "event_count": [10, 20]})
         return Resultado(tabla=tabla, query_id="q-falsa", segundos=0.1, bytes_escaneados=2048)
 
 
@@ -283,9 +404,17 @@ def probar_ejecucion(manifest: str) -> None:
             assert len(falso.sql) == 1                                                # EXPLAIN no ejecuta
             assert c.execute("SELECT metric FROM semantic.metrics WHERE metric = 'event_count'").fetchall()
             assert len(falso.sql) == 1                                                # el catálogo no va a Athena
+            cur = c.execute("SELECT event__event_date, event_count FROM semantic.events")  # fecha sin grano
+            assert [d.name for d in cur.description] == ["event__event_date", "event_count"]
+            assert str(cur.fetchall()[0][0]) == "2024-01-01"
+        with psycopg.connect(f"host=127.0.0.1 port={port} user=bi password=bi dbname=athena", autocommit=True,
+                             prepare_threshold=0) as c:                              # protocolo extendido
+            c.execute("SELECT event__platform, event_count FROM semantic.events WHERE event__platform = 'IOS'").fetchall()
+            assert "'IOS'" in falso.sql[-1], falso.sql[-1]                            # el literal conserva mayúsculas
+        n = len(falso.sql)
         with _connect(port, "snowflake") as c:                                       # sin ejecutor: devuelve el SQL
             assert c.execute("SELECT event_count FROM semantic.events").description[0].name == "sql"
-        assert len(falso.sql) == 1
+        assert len(falso.sql) == n
     finally:
         server.shutdown()
     print("OK · ejecución: filas en dbname=athena, SQL en EXPLAIN y en motores sin ejecutor")

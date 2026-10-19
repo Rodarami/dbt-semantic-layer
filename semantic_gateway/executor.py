@@ -107,15 +107,22 @@ class EjecutorAthena:
                          bytes_escaneados=getattr(cursor, "data_scanned_in_bytes", None), truncado=truncado)
 
 
+_GRANOS = ("day", "week", "month", "quarter", "year", "hour", "minute", "second", "millisecond")
+
+
 def ordenar_columnas(tabla: pa.Table, salida: list[tuple[str, str]]) -> pa.Table:
     """Deja las columnas en el orden del SELECT del cliente y con sus nombres (alias incluidos).
 
-    MetricFlow devuelve primero las dimensiones y después las métricas; Athena, en minúsculas.
+    MetricFlow devuelve primero las dimensiones y después las métricas; Athena, en minúsculas. Una dimensión de tiempo
+    pedida sin grano (`event__event_date`) vuelve con el grano por defecto en el nombre (`event__event_date__day`).
     """
     por_nombre = {n.lower(): i for i, n in enumerate(tabla.column_names)}
     columnas, nombres = [], []
     for columna_mf, publicada in salida:
         i = por_nombre.get(columna_mf.lower())
+        if i is None:  # dimensión de tiempo pedida sin grano: MetricFlow la devuelve como <nombre>__day
+            candidatas = [por_nombre[f"{columna_mf.lower()}__{g}"] for g in _GRANOS if f"{columna_mf.lower()}__{g}" in por_nombre]
+            i = candidatas[0] if len(candidatas) == 1 else None
         if i is None:
             raise ExecutionError(f"El resultado no trae la columna '{columna_mf}' (columnas: {', '.join(tabla.column_names)})")
         columnas.append(tabla.column(i))

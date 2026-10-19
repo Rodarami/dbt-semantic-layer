@@ -1,8 +1,11 @@
-# Dependencias del gateway semántico (se suman a las de dbt/MetricFlow del README, sección 3)
+# Dependencias del gateway semántico (se suman a las de dbt/MetricFlow del README)
+# riffq trae paquetes precompilados para Python 3.12 (Windows, Linux) y 3.14 (Mac Apple Silicon); con otra versión
+# hace falta Rust para compilarlo.
 metricflow==0.213.0
-buenavista==0.5.0       # servidor Postgres wire (Python puro)
-sqlglot>=30             # traductor SQL -> consulta semántica
+riffq==0.1.11           # servidor Postgres wire actual (server.py): núcleo Rust con pgwire, TLS, autenticación
+buenavista==0.5.0       # servidor anterior (server_old.py), Python puro
+sqlglot>=30             # traductor SQL -> consulta semántica y catálogo
 pyarrow
-duckdb                  # catálogo en memoria que ven los clientes (information_schema, pg_catalog)
-pyathena[arrow]>=3.0   # ejecución en Athena (--ejecutar)
+duckdb>=1.1             # catálogo en memoria (information_schema, pg_catalog); >=1.1 por lock_configuration y extract_statements
+pyathena[arrow]>=3.0    # ejecución en Athena (--ejecutar)
 psycopg[binary]>=3.2    # solo para test_gateway.py

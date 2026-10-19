@@ -52,8 +52,8 @@ En PowerShell no existe `source`. El entorno virtual se activa con `Activate.ps1
 ```powershell
 cd "C:\Users\<usuario>\Documents\Cencosud\DATA CORE\CapaSemantica"
 
-# crear (una vez)
-python -m venv dbt_venv
+# crear (una vez) con Python 3.12: riffq, el servidor del gateway, trae paquete precompilado para esa versión
+py -3.12 -m venv dbt_venv
 .\dbt_venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r dbt-semantic-layer\requirements-gateway.txt   # incluye boto3 y pyathena
@@ -221,6 +221,9 @@ python -m semantic_gateway --manifest semantic_manifests/it-people/semantic_mani
   --region us-east-1 --athena-workgroup DataEngineer
 ```
 
+Para cifrar la conexión agregar `--tls-cert <ruta>\server.crt --tls-key <ruta>\server.key --tls-obligatorio`
+(los archivos fuera del repo; en DBeaver, pestaña *SSL* en modo `require`).
+
 En PowerShell la línea se continúa con acento grave (`` ` ``), no con `\`. Con la opción C (o `AWS_PROFILE` definido) no
 hace falta `--aws-profile`; con la opción B sin `AWS_PROFILE`, agregar `--aws-profile cenco`.
 
@@ -232,6 +235,13 @@ Gateway listo en 127.0.0.1:5433 · semantic.{employee_headcount} · … · ejecu
 ```
 
 Conexión en DBeaver: PostgreSQL · `127.0.0.1` · puerto `5433` · base `athena` · usuario `bi` · clave `bi`.
+
+Si un cliente falla con el servidor actual (riffq), se puede levantar el anterior (buenavista) con las mismas opciones:
+
+```powershell
+python -m semantic_gateway.server_old --manifest semantic_manifests/it-people/semantic_manifest.json --motor athena --ejecutar `
+  --region us-east-1 --athena-workgroup DataEngineer
+```
 
 ---
 

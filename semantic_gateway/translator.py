@@ -196,6 +196,12 @@ class Translator:
                 return exp.Var(this=f"{{{{ TimeDimension('{name}') }}}}")
             return exp.Var(this=f"{{{{ Dimension('{name}') }}}}")
 
+        # MetricFlow procesa el filtro como plantilla Jinja: un valor del usuario con `{{`, `{%` o `{#` se evaluaría y
+        # podría cerrar la comilla del literal e inyectar SQL en la consulta del motor. Se revisa el texto del usuario
+        # (sin los `{{ Dimension(…) }}` que agrega el traductor).
+        texto_usuario = condition.sql(dialect=dialect)
+        if _JINJA.search(texto_usuario):
+            raise TranslationError("Los filtros no pueden contener '{{', '{%' ni '{#'")
         return condition.transform(to_jinja).sql(dialect=dialect)
 
     def _order_name(self, node: exp.Expression, sq: SemanticQuery, aliases: dict[str, str]) -> str:
@@ -209,6 +215,9 @@ class Translator:
         if name not in sq.metrics and name not in sq.group_by:
             raise TranslationError(f"ORDER BY '{name}': la columna debe estar en el SELECT")
         return name
+
+
+_JINJA = re.compile(r"\{[{%#]")  # inicio de expresión, bloque o comentario Jinja
 
 
 def _date(node: Optional[exp.Expression]) -> Optional[dt.date]:
