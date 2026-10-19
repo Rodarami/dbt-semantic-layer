@@ -113,8 +113,12 @@ Todo vive en el esquema `semantic`.
 
 Cada modelo semántico que tenga métricas se publica como una tabla `semantic.<modelo>`, con el nombre del modelo.
 Contiene sus métricas y **solo** las dimensiones que se pueden cruzar con todas ellas. Por eso cualquier combinación de
-columnas de una misma tabla es consultable. Las tablas están vacías: sirven como carta de lo que se puede pedir. Para
-ver qué tablas publicó el gateway con el manifest que se cargó:
+columnas de una misma tabla es consultable. Las tablas no guardan filas: en el catálogo están vacías y sirven como
+carta de lo que se puede pedir; al consultarlas con `--ejecutar`, el gateway calcula las filas en ese momento con
+MetricFlow y Athena. Detalle de cada métrica de IT People:
+[it_people_capa_semantica.md](../semantic_manifests/it-people/it_people_capa_semantica.md), sección 3. Uso de estas
+tablas en Power BI: [power_bi_directquery.md](power_bi_directquery.md), sección 5. Para ver qué tablas publicó el
+gateway con el manifest que se cargó:
 
 ```sql
 SELECT table_name FROM information_schema.tables WHERE table_schema = 'semantic';
@@ -276,7 +280,8 @@ La lista completa de clases y funciones, con quién las llama y su capa del ADR,
     el *núcleo* y va a MetricFlow y al motor; el *resto* se ejecuta en una base DuckDB efímera y blindada (sin
     archivos ni red, una sola sentencia `SELECT`) sobre el resultado del núcleo, que ya viene agregado y es chico.
     Solo con motor ejecutor (`dbname=athena`); en `EXPLAIN` o sin ejecutor se devuelve el SQL del núcleo. Si hay dos
-    núcleos (joins entre tablas semánticas) o el resto lee otra tabla, se rechaza.
+    núcleos (joins entre tablas semánticas) o el resto lee otra tabla, se rechaza. Detalle y motivos:
+    [duckdb_efimero.md](duckdb_efimero.md).
 - `_unknown_column`: si la columna existe en otra tabla, el error lo dice: *La columna 'item__category' no está en la
   tabla 'events'; está en: items*.
 - `_where` y `_time_constraint`: las condiciones sobre `metric_time*` con `>=`, `<=`, `=` o `BETWEEN` y fecha literal se
@@ -727,6 +732,9 @@ Revisión de seguridad del 17 de octubre de 2026. Cada ataque se probó contra e
 ---
 
 ## 11. Conectarse
+
+> Power BI (DirectQuery e Importar), con el paso a paso para armar paneles:
+> [power_bi_directquery.md](power_bi_directquery.md).
 
 ### 11.1 Elegir el motor con `dbname`
 

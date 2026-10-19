@@ -59,7 +59,7 @@ consultas de catálogo que envía DBeaver y el lote de tipos de Npgsql (Power BI
 | --- | --- |
 | riffq está en preversión (0.1.x) | Fijar la versión en `requirements-gateway.txt` y correr `python -m tests.test_gateway` antes de actualizar |
 | Paquetes precompilados para pocas versiones de Python | Usar Python 3.12 (Windows) o 3.14 (Mac Apple Silicon), o instalar Rust para compilarlo |
-| Power BI todavía no está probado de punta a punta con riffq | Probar en modo Importar con SQL nativo; los errores nuevos se ven en el log del gateway |
+| Power BI genera SQL propio en DirectQuery (subconsultas, `CASE`, `cast`) que puede cambiar con cada versión | Probado de punta a punta en Importar y DirectQuery (octubre de 2026). Si una versión nueva manda otra forma, el gateway la registra con `--log-sql` como *Consulta rechazada*; ver [power_bi_directquery.md](power_bi_directquery.md) |
 | Parámetros de texto sin tipo | Solo afecta a clientes que no declaran tipos (psycopg por defecto) |
 | La puerta de `--tls-obligatorio` es Python (asyncio) y suma un salto local | Despreciable frente a la latencia de Athena. Si riffq agrega una opción para exigir TLS, se reemplaza |
 | Balanceador en AWS | Debe ser un NLB con listener **TCP**: un listener TLS no sirve, porque los clientes Postgres envían primero el `SSLRequest` sin cifrar |

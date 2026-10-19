@@ -659,7 +659,9 @@ filtros sobre métricas y parámetros.
 
 Cinco consultas típicas de un dashboard. Se escriben tal cual en el editor SQL de la herramienta: en Metabase,
 *Nuevo → Consulta SQL* sobre la conexión del gateway; en DBeaver, un *SQL Editor* sobre la conexión; en Power BI,
-*Base de datos PostgreSQL* con la consulta en *Opciones avanzadas* (modo Importar).
+*Base de datos PostgreSQL* con la consulta en *Opciones avanzadas* (modo Importar). En Power BI lo habitual es
+DirectQuery sin consulta: se elige la tabla `semantic.<modelo>` y se arrastran métricas y dimensiones a cada visual
+([docs/power_bi_directquery.md](../../docs/power_bi_directquery.md)).
 
 Para cada ejemplo se muestra la consulta que escribe el analista, el SQL que genera el gateway (motor `athena`, sin
 los comentarios de MetricFlow) y qué resultado da. Con `--ejecutar` el gateway devuelve esas filas; sin esa opción
@@ -1006,7 +1008,7 @@ consultas se escriben en *Nuevo → Consulta SQL*. Detalle en
 | Opción | Cómo | Limitaciones |
 |---|---|---|
 | **Tablas gold + Athena** | Materializar métricas en modelos gold y leerlos con el conector Amazon Athena de Power BI | No usa el motor de MetricFlow; la definición queda duplicada en SQL/DAX |
-| **Gateway semántico (11 ter)** | Conector PostgreSQL de Power BI apuntando al gateway (servidor `host:5433`, base de datos `athena`), con `--ejecutar` | Modo Importar: conecta y navega (catálogo de tipos de Npgsql, `DISCARD ALL` y errores a mitad de lote resueltos). DirectQuery: el SQL que genera Power BI (subconsultas, `SUM` sobre columnas) requiere ampliar el traductor. En Power BI Service hace falta un data gateway y, con TLS, un certificado de una CA de confianza |
+| **Gateway semántico (11 ter)** | Conector PostgreSQL de Power BI apuntando al gateway (servidor `host:5433`, base de datos `athena`), con `--ejecutar`, en modo **DirectQuery** (recomendado) o Importar | Funciona en ambos modos: el gateway aplana las subconsultas de Power BI y, si agrega `CASE`/`cast`, manda a Athena solo la parte semántica y aplica el resto en DuckDB. Un visual no puede mezclar dos tablas semánticas ni usar relaciones. En Power BI Service hace falta un data gateway y, con TLS, un certificado de una CA de confianza. Guía: [docs/power_bi_directquery.md](../../docs/power_bi_directquery.md) |
 | **dbt Cloud Semantic Layer** | Conector oficial de Power BI (Preview, DirectQuery) | Requiere licencia dbt platform y Snowflake/BigQuery/Databricks/Redshift/Postgres/Trino; no soporta Glue |
 
 ---
@@ -1029,6 +1031,7 @@ consultas se escriben en *Nuevo → Consulta SQL*. Detalle en
 | DBeaver: *Scalar Function with name pg_get_partkeydef does not exist* | Gateway sin la compatibilidad con DBeaver | Actualizar `server.py` y reiniciar el gateway |
 | Metabase en Docker no llega al gateway | El gateway escucha solo en `127.0.0.1` | `--host 0.0.0.0` y host `host.docker.internal` |
 | *Table with name dbt_glue_lab does not exist* | Consulta de la versión anterior del gateway (tabla única) | Usar las tablas `semantic.<modelo>` (en este proyecto, `semantic.events` o `semantic.items`) |
+| Power BI: *Expresión no soportada: CASE WHEN…*, *Las subconsultas no están soportadas* o *No se ha podido plegar la expresión* | Gateway anterior a la compatibilidad con DirectQuery | `git pull` y reiniciar el gateway ([docs/power_bi_directquery.md](../../docs/power_bi_directquery.md), sección 10) |
 | Una métrica nueva no aparece en el gateway | El manifest se lee solo al arrancar | `dbt parse`, reiniciar el gateway y sincronizar en Metabase |
 
 Más errores del gateway: [docs/gateway_semantico.md, sección 15](../../docs/gateway_semantico.md#15-errores-frecuentes).
@@ -1158,7 +1161,7 @@ usuario, RLS/PII, caché, auditoría formal y otros motores).
 
 | Paso del ADR | Estado | Dónde / qué falta |
 | --- | --- | --- |
-| 1. La presentation layer envía la petición al serving layer | Hecho (Postgres wire) | `server.py` sobre riffq. Probado con psql, Jupyter, DBeaver y Metabase; Power BI en modo Importar |
+| 1. La presentation layer envía la petición al serving layer | Hecho (Postgres wire) | `server.py` sobre riffq. Probado con psql, Jupyter, DBeaver, Metabase y Power BI (Importar y DirectQuery) |
 | 2. El serving layer autentica y traduce a consulta semántica | Parcial | Traducción hecha (`translator.py` → `SemanticQuery`). Autenticación: un usuario fijo, sin IdP; TLS opcional u obligatorio (`--tls-obligatorio`) |
 | 3. El gateway autoriza, añade RLS/objeto/PII y revisa la caché | Pendiente | No existe capa gateway: `server.py` llama directo a `engine.py` |
 | 4. MetricFlow compila a SQL contra el `semantic_manifest.json` | Hecho | `engine.py` (`SemanticEngine.explain`), sin conexión |
@@ -1183,7 +1186,7 @@ usuario, RLS/PII, caché, auditoría formal y otros motores).
 | Componente | Estado | Qué hay | Qué falta |
 | --- | --- | --- | --- |
 | Endpoint Postgres wire | Hecho (PoC) | `server.py` sobre riffq (TLS opcional u obligatorio con `--tls-obligatorio`); catálogo en DuckDB; compatibilidad con Metabase, DBeaver y Npgsql. `server_old.py` (buenavista) como respaldo | Probar Power BI en DirectQuery (vía data gateway) y MicroStrategy; medir rendimiento |
-| Traductor de peticiones | Parcial | SQL simple → `SemanticQuery` (métricas, group by, filtros, rango de tiempo, orden, límite) | Aceptar el SQL que generan los BI (constructor de Metabase, DirectQuery de Power BI: `DATE_TRUNC`, `COUNT(*)`, subconsultas, parámetros) y `SELECT *` |
+| Traductor de peticiones | Parcial | SQL simple → `SemanticQuery` (métricas, group by, filtros, rango de tiempo, orden, límite) | DirectQuery de Power BI ya aceptado (subconsultas aplanadas; `CASE`/`cast`/`COUNT` en DuckDB sobre el núcleo). Falta: constructor de Metabase (`DATE_TRUNC`, parámetros) y `SELECT *` |
 | Vistas de consumo como tablas virtuales | Parcial | Una tabla por modelo semántico, generada desde cualquier manifest (aquí `semantic.events` y `semantic.items`; con IT People, `semantic.employee_headcount`) | Vistas de consumo curadas por dominio, si se definen en el YAML |
 | Exponer el catálogo de métricas y dimensiones | Hecho | `semantic.metrics`, `semantic.dimensions`, `semantic.metric_dimensions` | Agregar owner, SLA y glosario cuando vengan del YAML y de OpenMetadata |
 | API REST/GraphQL (data apps, notebooks) | Pendiente | — | Exponer el mismo `SemanticQuery` por HTTP |
@@ -1232,7 +1235,7 @@ usuario, RLS/PII, caché, auditoría formal y otros motores).
 
 | Consumidor | Patrón del ADR | Estado en el laboratorio |
 | --- | --- | --- |
-| Power BI | Conector PostgreSQL en DirectQuery vía on-premises data gateway | Importar: conecta y navega, tras adaptar el catálogo a Npgsql. DirectQuery: pendiente (requiere ampliar el traductor). Es el riesgo «paridad con Power BI» del ADR |
+| Power BI | Conector PostgreSQL en DirectQuery vía on-premises data gateway | Importar y DirectQuery funcionando en Power BI Desktop (catálogo adaptado a Npgsql; traductor con aplanado y núcleo + resto). Falta probar en Power BI Service con el data gateway. Es el riesgo «paridad con Power BI» del ADR ([docs/power_bi_directquery.md](../../docs/power_bi_directquery.md)) |
 | MicroStrategy | Fuente PostgreSQL genérica | No probado |
 | Metabase | Fuente PostgreSQL; cada vista de consumo como una tabla | Probado: conexión, sincronización de esquema y SQL nativo. El constructor visual aún no |
 | Agentes IA | Solo vía MCP | Pendiente (no hay servidor MCP) |
@@ -1243,7 +1246,7 @@ usuario, RLS/PII, caché, auditoría formal y otros motores).
 | Riesgo del ADR | Qué se sabe hoy |
 | --- | --- |
 | Cobertura de motores de MetricFlow («Athena está por validar») | MetricFlow compila SQL de Athena para las 11 métricas y el gateway lo **ejecuta** en Athena (manifests `dbt_glue_lab` e `it-people`). Falta comparar sistemáticamente contra conteos directos |
-| Paridad con Power BI (DirectQuery sobre Postgres wire) | Modo Importar funcionando tras adaptar el catálogo a Npgsql (tipos, `DISCARD ALL`, errores a mitad de lote). DirectQuery sin probar: requiere ampliar el traductor |
+| Paridad con Power BI (DirectQuery sobre Postgres wire) | Importar y DirectQuery funcionando en Power BI Desktop: catálogo adaptado a Npgsql (tipos, `DISCARD ALL`, errores a mitad de lote, tipos de `information_schema` para el plegado) y traductor que acepta los envoltorios de DirectQuery. Pendiente: Power BI Service y visuales que combinan tablas |
 | Divergencia del formato del modelo (dbt 1.12 eliminó `measures`) | El proyecto ya usa la spec nueva; MetricFlow fijado en 0.213.0 |
 | Rendimiento y costo en Athena | El log registra segundos y bytes escaneados por consulta; falta medirlo con carga real y agregar caché |
 | Dependencia de MetricFlow OSS | Mitigado en el diseño: MetricFlow está aislado tras `SemanticEngine` |
@@ -1262,8 +1265,8 @@ Orden propuesto, de lo que más desbloquea a lo que más depende de otras piezas
 5. **Gestor del manifiesto**: el CI publica el manifest por entorno y el gateway lo recarga en caliente.
 6. **CI/CD en GitHub Enterprise**: validación del modelo, atributos obligatorios (owner, SLA), CODEOWNERS por
    dominio, y despliegue del runtime en EKS con alta disponibilidad.
-7. **Power BI en DirectQuery** (vía on-premises data gateway) y MicroStrategy, con informes reales; ampliar el
-   traductor al SQL que generan (el modo Importar ya funciona).
+7. **Power BI Service** (DirectQuery vía on-premises data gateway, ya funciona en Desktop) y MicroStrategy, con
+   informes reales.
 8. **Semantic models sobre Gold** y atributos de certificación en el YAML.
 9. **Observabilidad**: latencia p95, errores, costo y uso por métrica, dominio y consumidor.
 10. **Nuevos protocolos**: API REST/GraphQL y servidor MCP sobre el mismo motor.

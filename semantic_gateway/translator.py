@@ -293,8 +293,12 @@ def _aplanar(tree: exp.Select) -> exp.Select:
             nombre_salida = p.alias if isinstance(p, exp.Alias) else None
             col = p.unalias()
             if isinstance(col, _AGREGACIONES) and isinstance(col.this, exp.Column):
-                # DirectQuery: SUM("_"."metrica") agrupado afuera = la métrica al nivel de las columnas agrupadas
-                base = col.__class__(this=interna_de(col.this).unalias().copy())
+                # DirectQuery: SUM("_"."metrica") agrupado afuera = la métrica al nivel de las columnas agrupadas.
+                # Si adentro ya venía agregada (SUM(metrica) por cargo), afuera no se vuelve a sumar: el total de Power
+                # BI es la métrica sin esas dimensiones, calculada por MetricFlow (sumar ratios o conteos distintos de
+                # cada fila daría un número falso).
+                interior = interna_de(col.this).unalias()
+                base = interior.copy() if isinstance(interior, _AGREGACIONES) else col.__class__(this=interior.copy())
                 proyecciones.append(exp.alias_(base, nombre_salida or col.this.name, quoted=True))
                 continue
             if not isinstance(col, exp.Column):

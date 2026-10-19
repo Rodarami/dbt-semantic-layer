@@ -21,9 +21,11 @@ buenavista, se conserva como respaldo en `server_old.py`.
 | Protocolo PostgreSQL | `server.py` sobre **riffq** (Rust) | Conexiones, autenticación, TLS, protocolo simple y extendido |
 | Enrutamiento | `server.py` (`ConexionSemantica._resolver`) | Decide quién responde cada consulta (imagen siguiente) |
 | Catálogo | `catalogo_pg.py` + **DuckDB** en memoria | `information_schema`, `pg_catalog`, tablas vacías `semantic.<modelo>` y `semantic.metrics`/`dimensions` |
-| Traductor | `translator.py` (sqlglot) | SQL del cliente → consulta semántica |
+| Traductor | `translator.py` (sqlglot) | SQL del cliente → consulta semántica; aplana las subconsultas de Power BI y, si traen `CASE`/`cast`, separa núcleo y resto |
 | Compilador | `engine.py` (MetricFlow) | Consulta semántica → SQL del motor, sin conectarse |
 | Ejecutor | `executor.py` (PyAthena) | Con `--ejecutar`: corre el SQL en Athena y devuelve filas (cancela a los 100 s) |
+| Resto del BI | `server.py` (`_resto_en_duckdb`) + DuckDB efímero | Aplica sobre las filas del núcleo lo que Power BI DirectQuery agrega alrededor (`CASE`, `cast`, orden, límite). Ver [docs/duckdb_efimero.md](docs/duckdb_efimero.md) |
+| TLS obligatorio | `tls_obligatorio.py` (`PuertaTLS`) | Con `--tls-obligatorio`: rechaza clientes sin SSL antes de llegar a riffq |
 
 ![Quién responde cada consulta](docs/img/gateway_rutas_riffq.png)
 
@@ -65,6 +67,8 @@ MetricFlow/                              # raíz del repositorio git
 ├── docs/consultas_it_people.md          # 23 consultas para el manifest it-people (dotación)
 ├── docs/comparativa_protocolo.md        # buenavista vs riffq vs alternativas, y prueba del catálogo sin DuckDB
 ├── docs/credenciales_aws_windows.md     # credenciales de AWS en Windows para --ejecutar
+├── docs/power_bi_directquery.md         # Power BI: DirectQuery, conexión y armado de paneles
+├── docs/duckdb_efimero.md               # por qué existe el DuckDB efímero (núcleo + resto) y qué resuelve
 ├── docs/img/                            # arquitectura_gateway_actual.png, gateway_rutas_riffq.png
 ├── requirements-gateway.txt
 └── DBT/
@@ -76,6 +80,8 @@ MetricFlow/                              # raíz del repositorio git
 | `semantic_gateway/`, `tests/`, `notebooks/` | [docs/gateway_semantico.md](docs/gateway_semantico.md) (instalación, uso y referencia) |
 | Cómo funciona el gateway por dentro y cobertura del ADR | [docs/arquitectura_gateway.md](docs/arquitectura_gateway.md) |
 | Consultas para DBeaver y Metabase, una guía por manifest | [dbt_glue_lab](docs/consultas_dbt_glue_lab.md) · [it-people](docs/consultas_it_people.md) |
+| DuckDB efímero: por qué se creó, qué problema resuelve y diferencias con el del catálogo | [docs/duckdb_efimero.md](docs/duckdb_efimero.md) |
+| Power BI en DirectQuery: cómo funciona, conexión y paneles | [docs/power_bi_directquery.md](docs/power_bi_directquery.md) |
 | Credenciales de AWS en Windows (PowerShell) para ejecutar en Athena | [docs/credenciales_aws_windows.md](docs/credenciales_aws_windows.md) |
 | Librería del protocolo: buenavista vs riffq vs alternativas | [docs/comparativa_protocolo.md](docs/comparativa_protocolo.md) |
 | `DBT/dbt_glue_lab/` | [DBT/dbt_glue_lab/README.md](DBT/dbt_glue_lab/README.md) (incluye el estado frente al ADR, sección 15) |
@@ -209,8 +215,11 @@ netstat -ano | findstr :5433
 | Usuario / contraseña | `bi` / `bi` (solo pruebas locales) |
 | SSL | Desactivado; con `--tls-cert`/`--tls-key`, `require` (con `--tls-obligatorio`, las conexiones sin SSL se rechazan) |
 
-En Power BI: *Obtener datos* → *Base de datos PostgreSQL*, servidor `127.0.0.1:5433`, base `athena`, modo *Importar*.
-Con TLS, Power BI valida el certificado: uno autofirmado no sirve (hace falta uno de una CA de confianza).
+En Power BI: *Obtener datos* → *Base de datos PostgreSQL*, servidor `127.0.0.1:5433`, base `athena`, modo
+**DirectQuery** (recomendado: cada visual pide a MetricFlow la métrica a su grano, así los ratios y totales salen
+bien) o *Importar*. En el navegador marcar la tabla `semantic.<modelo>` y *Cargar*. Con TLS, Power BI valida el
+certificado: uno autofirmado no sirve (hace falta uno de una CA de confianza). Guía completa, reglas y armado de
+paneles: [docs/power_bi_directquery.md](docs/power_bi_directquery.md).
 
 ```sql
 SELECT table_name FROM information_schema.tables WHERE table_schema = 'semantic';  -- qué tablas publicó el manifest

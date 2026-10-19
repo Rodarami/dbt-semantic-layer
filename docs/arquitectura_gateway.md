@@ -566,7 +566,7 @@ El ADR define la ruta única de una consulta en siete pasos:
 
 | # | Paso del ADR | Implementación | Estado |
 | --- | --- | --- | --- |
-| 1 | La presentation layer envía una petición al serving layer | Endpoint Postgres wire sobre riffq (núcleo Rust con `pgwire`), probado con DBeaver, Metabase, psql y Python; Power BI en prueba | ✅ Cubierto |
+| 1 | La presentation layer envía una petición al serving layer | Endpoint Postgres wire sobre riffq (núcleo Rust con `pgwire`), probado con DBeaver, Metabase, psql, Python y Power BI (Importar y DirectQuery, [power_bi_directquery.md](power_bi_directquery.md)) | ✅ Cubierto |
 | 2 | El serving layer autentica al consumidor y traduce la petición a una consulta semántica | Usuario y clave fijos en `handle_auth` (punto de extensión para el IdP) y TLS opcional u obligatorio (`--tls-obligatorio`); traducción completa con `Translator` → `SemanticQuery` | 🟡 Traducción cubierta; autenticación mínima |
 | 3 | El gateway autoriza, añade los filtros de seguridad (RLS, objeto, PII) y comprueba la caché | No hay autorización, RLS, PII ni caché | ❌ Pendiente |
 | 4 | El gateway entrega la consulta al metric engine; MetricFlow la compila a SQL | `SemanticEngine.explain` con MetricFlow OSS embebido, solo compila | ✅ Cubierto |

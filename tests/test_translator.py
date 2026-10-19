@@ -157,6 +157,20 @@ def test_nucleo_y_resto() -> None:
                             "FROM items) b ON true") is None                                  # dos núcleos
 
 
+def test_total_de_power_bi() -> None:
+    """El total de un visual (SUM sobre la consulta ya agrupada) se pide a MetricFlow sin las dimensiones: sumar los
+    ratios de cada fila daría un número falso (por ejemplo 70,6 para un ratio)."""
+    sq = T.translate('select sum("rows"."a0") as "a0" from (select "event__platform" as "c1", '
+                     'sum("item_views_per_user") as "a0" from "semantic"."events" "$Table" '
+                     'where "event__platform" = \'ios\' group by "event__platform") "rows"')
+    assert (sq.metrics, sq.group_by, sq.output) == (["item_views_per_user"], [], [("item_views_per_user", "a0")]), sq
+    assert sq.where == ["{{ Dimension('event__platform') }} = 'ios'"], sq.where       # el filtro se conserva
+    sq = T.translate('select "rows"."c1", sum("rows"."a0") as "a0" from (select "event__platform" as "c1", '
+                     '"event__is_mobile", sum("item_views") as "a0" from "semantic"."events" "$Table" '
+                     'group by "event__platform", "event__is_mobile") "rows" group by "rows"."c1"')
+    assert (sq.metrics, sq.group_by) == (["item_views"], ["event__platform"]), sq      # subtotal por plataforma
+
+
 if __name__ == "__main__":
     tests = [f for name, f in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:
