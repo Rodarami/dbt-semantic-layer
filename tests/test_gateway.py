@@ -384,6 +384,8 @@ class _EjecutorFalso:
         self.sql.append(sql)
         if "event__event_date__day" in sql:  # dimensión de tiempo sin grano: MetricFlow le agrega __day
             tabla = pa.table({"event__event_date__day": [dt.date(2024, 1, 1)], "event_count": [7]})
+        elif "metric_time__day" in sql:  # metric_time y metric_time__day: una sola columna en MetricFlow
+            tabla = pa.table({"metric_time__day": [dt.date(2024, 1, 2)], "event_count": [3]})
         else:
             tabla = pa.table({"event__platform": ["ios", "android"], "event_count": [10, 20]})
         return Resultado(tabla=tabla, query_id="q-falsa", segundos=0.1, bytes_escaneados=2048)
@@ -407,6 +409,11 @@ def probar_ejecucion(manifest: str) -> None:
             cur = c.execute("SELECT event__event_date, event_count FROM semantic.events")  # fecha sin grano
             assert [d.name for d in cur.description] == ["event__event_date", "event_count"]
             assert str(cur.fetchall()[0][0]) == "2024-01-01"
+            # Power BI al cargar una tabla completa pide todas sus columnas: metric_time y metric_time__day a la vez
+            cur = c.execute("SELECT metric_time, metric_time__day, event_count FROM semantic.events ORDER BY metric_time")
+            assert [d.name for d in cur.description] == ["metric_time", "metric_time__day", "event_count"]
+            fila = cur.fetchone()
+            assert [str(fila[0]), str(fila[1])] == ["2024-01-02", "2024-01-02"] and float(fila[2]) == 3, fila
         with psycopg.connect(f"host=127.0.0.1 port={port} user=bi password=bi dbname=athena", autocommit=True,
                              prepare_threshold=0) as c:                              # protocolo extendido
             c.execute("SELECT event__platform, event_count FROM semantic.events WHERE event__platform = 'IOS'").fetchall()

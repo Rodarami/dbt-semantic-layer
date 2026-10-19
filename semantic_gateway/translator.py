@@ -71,6 +71,7 @@ class Translator:
                 raise TranslationError("SELECT * no está soportado: elija métricas y dimensiones")
             name, aggregated = self._column(projection.unalias())
             published = projection.alias if isinstance(projection, exp.Alias) else name
+            name = _canonico(name)  # metric_time = metric_time__day: MetricFlow no acepta ambas en la misma consulta
             if self.catalog.is_metric(name, table):
                 if name not in sq.metrics:
                     sq.metrics.append(name)
@@ -211,10 +212,16 @@ class Translator:
                 raise TranslationError(f"ORDER BY {node.this} fuera de rango")
             return sq.output[index][0]
         name, _ = self._column(node)
-        name = aliases.get(name, name)
+        name = _canonico(aliases.get(name, name))
         if name not in sq.metrics and name not in sq.group_by:
             raise TranslationError(f"ORDER BY '{name}': la columna debe estar en el SELECT")
         return name
+
+
+def _canonico(name: str) -> str:
+    """`metric_time` sin grano es `metric_time__day` (el grano por defecto). Pedir las dos (Power BI lo hace al cargar
+    una tabla completa) haría que MetricFlow rechace la consulta por columnas duplicadas."""
+    return f"{METRIC_TIME}__day" if name == METRIC_TIME else name
 
 
 _JINJA = re.compile(r"\{[{%#]")  # inicio de expresión, bloque o comentario Jinja
