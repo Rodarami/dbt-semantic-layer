@@ -13,7 +13,8 @@ data/*.csv ──► bronze (lab_data_bronze) ──► silver (lab_data_silver)
                                                    └──── capa semántica (YAML) ───► semantic_manifest.json
                                                                                          │
                                        mf (local, perfil DuckDB)  ◄──────────────────────┤
-                                       gateway semántico (Postgres wire)  ◄──────────────┘  → Metabase, DBeaver, psql
+                                       gateway semántico (Postgres wire)  ◄──────────────┘  → DBeaver, Metabase, Power BI, psql
+                                                                                              (compila y ejecuta en Athena)
 ```
 
 ---
@@ -46,6 +47,7 @@ data/*.csv ──► bronze (lab_data_bronze) ──► silver (lab_data_silver)
 DBT-GLUE/
 ├── data/                                    # CSV de prueba (event.csv, item.csv, ...)
 ├── dbt_venv/                                # entorno virtual (no se versiona)
+├── ssl/                                     # certificado y clave TLS del gateway (fuera del repo)
 └── MetricFlow/                              # raíz del repositorio git
     ├── semantic_gateway/                    # gateway semántico por protocolo Postgres (11 ter)
     ├── tests/                               # pruebas del gateway
@@ -54,13 +56,14 @@ DBT-GLUE/
     │   ├── dbt_glue_lab/semantic_manifest.json
     │   └── it-people/semantic_manifest.json
     ├── notebooks/                           # sqlglot_paso_a_paso.ipynb
-    ├── docs/gateway_semantico.md            # documentación completa del gateway
+    ├── docs/                                # gateway_semantico.md, arquitectura_gateway.md, consultas_*.md…
     ├── requirements-gateway.txt             # dependencias del gateway
     ├── README.md                            # guía de MetricFlow (gateway, scripts, manifests)
     └── DBT/
         └── dbt_glue_lab/                    # ESTE proyecto dbt
             ├── dbt_project.yml              # configuración del proyecto
             ├── profiles.yml                 # perfil de conexión a Glue (el que usa dbt run)
+            ├── .env                         # ID de cuenta, bucket y rol (local, no se versiona; sección 4.1)
             ├── macros/
             │   └── generate_database_name.sql
             ├── models/
@@ -96,7 +99,7 @@ cp target/semantic_manifest.json ../../semantic_manifests/dbt_glue_lab/semantic_
 
 | Requisito | Detalle |
 |---|---|
-| Python | 3.10 o superior |
+| Python | **3.12** (Windows, Linux) o **3.14** (Mac Apple Silicon): son las versiones con paquete precompilado de riffq, el servidor del gateway. dbt solo funciona desde 3.10 |
 | Credenciales AWS | Perfil o variables con permiso para asumir el rol de Glue (`aws sts get-caller-identity` debe responder) |
 | Rol de Glue | `arn:aws:iam::<ID_CUENTA>:role/GlueInteractiveSessionRole`, usado por las sesiones interactivas |
 | Bucket S3 | `s3://<BUCKET>` (warehouse de Iceberg) |
@@ -111,8 +114,8 @@ cp target/semantic_manifest.json ../../semantic_manifests/dbt_glue_lab/semantic_
 La capa semántica usa la **spec nueva de dbt**, que exige **dbt 1.12 o superior**. Con dbt 1.10 `dbt parse` falla (ver [problemas conocidos](#13-problemas-conocidos)).
 
 ```bash
-cd /Users/rodrigo/DBT-GLUE
-python3 -m venv dbt_venv
+cd ~/DBT-GLUE
+python3.14 -m venv dbt_venv     # Mac Apple Silicon; en Linux, python3.12
 source dbt_venv/bin/activate
 
 python3 -m pip install --upgrade pip
@@ -129,7 +132,7 @@ python3 -m pip install "dbt-core>=1.12" "dbt-glue>=1.12.4" dbt-metricflow dbt-du
 Dependencias del gateway semántico (sección 11 ter), desde la raíz `MetricFlow/`:
 
 ```bash
-python3 -m pip install -r requirements-gateway.txt   # metricflow, buenavista, sqlglot, duckdb, pyarrow, psycopg
+python3 -m pip install -r requirements-gateway.txt   # metricflow, riffq, buenavista (respaldo), sqlglot, duckdb, pyarrow, pyathena, psycopg
 python3 -m pip install jupyterlab ipykernel          # opcional, para los notebooks
 ```
 
@@ -138,7 +141,7 @@ Comprobar:
 ```bash
 dbt --version     # Core 1.12.x y plugin glue 1.12.x
 mf --version
-python3 -c "import metricflow, buenavista, sqlglot, duckdb, psycopg; print('gateway ok')"
+python3 -c "import metricflow, riffq, sqlglot, duckdb, psycopg; print('gateway ok')"
 ```
 
 Si `pip` falla con `CERTIFICATE_VERIFY_FAILED`:
@@ -150,7 +153,7 @@ export REQUESTS_CA_BUNDLE=$SSL_CERT_FILE
 # y repetir la instalación
 ```
 
-Si también falla `certifi`, ejecuta `"/Applications/Python 3.10/Install Certificates.command"` (Python instalado desde python.org).
+Si también falla `certifi`, ejecuta `"/Applications/Python 3.14/Install Certificates.command"` (Python instalado desde python.org; ajustar la versión).
 
 ---
 
@@ -163,7 +166,7 @@ Campos principales:
 | Campo | Valor | Significado |
 |---|---|---|
 | `type` | `glue` | Adaptador dbt-glue |
-| `role_arn` | `GlueInteractiveSessionRole` | Rol que asume la sesión interactiva |
+| `role_arn` | `arn:aws:iam::{{ env_var('AWS_ACCOUNT_ID') }}:role/{{ env_var('GLUE_ROLE_NAME', …) }}` | Rol que asume la sesión interactiva |
 | `region` | `us-east-1` | Región AWS |
 | `glue_version` | `"5.0"` | Versión de Glue |
 | `workers` / `worker_type` | `2` / `G.1X` | Capacidad de la sesión |
@@ -171,14 +174,46 @@ Campos principales:
 | `session_provisioning_timeout_in_seconds` | `300` | Espera máxima para crear la sesión |
 | `glue_session_reuse` | `True` | Reutiliza la sesión entre comandos |
 | `schema` | `lab_data` | Prefijo de las bases (`lab_data_silver`, `lab_data_gold`) |
-| `location` | `s3://<BUCKET>` | Ubicación base de las tablas |
+| `location` | `s3://{{ env_var('DBT_S3_BUCKET') }}` | Ubicación base de las tablas |
 | `datalake_formats` | `iceberg` | Formato de tablas |
 | `conf` | `--conf spark...` | Catálogo Iceberg sobre Glue, lock en DynamoDB y OpenLineage |
+
+### 4.1 Variables de entorno (`.env`)
+
+El ID de cuenta, el bucket y el rol no están escritos en el código: `profiles.yml` y los modelos los leen con
+`env_var()`. Sus valores van en `dbt_glue_lab/.env`, que **no se versiona** (`.gitignore`):
+
+```bash
+# dbt_glue_lab/.env
+AWS_ACCOUNT_ID=<ID_CUENTA>
+DBT_S3_BUCKET=<BUCKET>
+GLUE_ROLE_NAME=GlueInteractiveSessionRole
+```
+
+| Variable | La usan | Para qué |
+|---|---|---|
+| `AWS_ACCOUNT_ID` | `profiles.yml` | ARN del rol de Glue y `spark.glue.accountId` |
+| `DBT_S3_BUCKET` | `profiles.yml`, `custom_location` de los modelos | Warehouse de Iceberg y ubicación de cada tabla |
+| `GLUE_ROLE_NAME` | `profiles.yml` | Nombre del rol (por defecto `GlueInteractiveSessionRole`) |
+
+Cargarlas en cada terminal nueva, antes de **cualquier** comando dbt (también `dbt parse`, porque los modelos usan
+`env_var()` en su configuración):
+
+```bash
+cd ~/DBT-GLUE/MetricFlow/DBT/dbt_glue_lab
+set -a; source .env; set +a     # set -a exporta las variables para que dbt las vea
+echo $DBT_S3_BUCKET             # comprobar
+```
+
+Si falta una, dbt falla con `Env var required but not provided: 'AWS_ACCOUNT_ID'`.
+
+### 4.2 Comprobar la conexión
 
 Comprobar la conexión (crea una sesión de Glue, puede tardar unos minutos):
 
 ```bash
 cd ~/DBT-GLUE/MetricFlow/DBT/dbt_glue_lab
+set -a; source .env; set +a   # variables AWS_ACCOUNT_ID, DBT_S3_BUCKET… (sección 4.1)
 unset DBT_PROFILES_DIR
 dbt debug
 ```
@@ -234,6 +269,7 @@ Construir:
 
 ```bash
 cd ~/DBT-GLUE/MetricFlow/DBT/dbt_glue_lab
+set -a; source .env; set +a   # variables AWS_ACCOUNT_ID, DBT_S3_BUCKET… (sección 4.1)
 unset DBT_PROFILES_DIR
 dbt run -s silver_event silver_item     # silver
 dbt run -s gold_top_item                # gold
@@ -329,6 +365,7 @@ dbt run -s metricflow_time_spine     # crea lab_data.metricflow_time_spine en Gl
 
 ```bash
 cd ~/DBT-GLUE/MetricFlow/DBT/dbt_glue_lab
+set -a; source .env; set +a   # variables AWS_ACCOUNT_ID, DBT_S3_BUCKET… (sección 4.1)
 unset DBT_PROFILES_DIR      # perfil de Glue
 dbt parse
 ```
@@ -360,6 +397,7 @@ Para explorar y ver el SQL en local se usa `mf_profiles/profiles.yml`, un perfil
 
 ```bash
 cd ~/DBT-GLUE/MetricFlow/DBT/dbt_glue_lab
+set -a; source .env; set +a   # variables AWS_ACCOUNT_ID, DBT_S3_BUCKET… (sección 4.1)
 export DBT_PROFILES_DIR=$PWD/mf_profiles
 dbt parse
 mf validate-configs --skip-dw
@@ -404,6 +442,7 @@ Objetivo: que el SQL que compila MetricFlow (sección 11 bis y gateway de la 11 
 
 ```bash
 cd ~/DBT-GLUE/MetricFlow/DBT/dbt_glue_lab
+set -a; source .env; set +a   # variables AWS_ACCOUNT_ID, DBT_S3_BUCKET… (sección 4.1)
 unset DBT_PROFILES_DIR
 dbt parse
 cp target/semantic_manifest.json ../../semantic_manifests/dbt_glue_lab/semantic_manifest.json
@@ -447,6 +486,7 @@ El ADR de la capa semántica define que MetricFlow **sólo compila** y que otro 
 
 ```bash
 cd ~/DBT-GLUE/MetricFlow/DBT/dbt_glue_lab
+set -a; source .env; set +a   # variables AWS_ACCOUNT_ID, DBT_S3_BUCKET… (sección 4.1)
 unset DBT_PROFILES_DIR
 dbt parse                                   # manifest de Glue, sin conexión
 cp target/semantic_manifest.json ../../semantic_manifests/dbt_glue_lab/semantic_manifest.json
@@ -472,17 +512,19 @@ python3 script/compilar_sin_conexion.py --motor snowflake \
 > pasos): [docs/gateway_semantico.md](../../docs/gateway_semantico.md).
 
 El paquete `MetricFlow/semantic_gateway/` es un servidor que **habla el protocolo de PostgreSQL**. Publica la capa semántica
-como **una tabla virtual por modelo semántico** (`semantic.events`, `semantic.items`). Cualquier cliente Postgres
+como **una tabla virtual por modelo semántico** con métricas, para cualquier manifest (con este proyecto,
+`semantic.events` y `semantic.items`). Cualquier cliente Postgres
 (psql, psycopg/Jupyter, DBeaver, Metabase, Power BI) se conecta y pide métricas y dimensiones como columnas.
 
-**En esta versión el gateway no ejecuta nada.** MetricFlow compila la consulta sin conectarse a ningún motor; el
-gateway **imprime el SQL** en su consola y lo devuelve al cliente como una fila con la columna `sql`.
+MetricFlow **solo compila** la consulta, sin conectarse a ningún motor. Con `--ejecutar`, el gateway **ejecuta ese
+SQL en Athena** (`executor.py`) y devuelve las filas; el SQL queda en el log. Sin `--ejecutar` (o con `EXPLAIN`),
+devuelve el SQL como una fila con la columna `sql`.
 
 ```
-cliente BI ──Postgres wire──► server.py (buenavista)
-                                 ├─ metadatos ──► catálogo en DuckDB en memoria (tablas vacías + catálogo)
-                                 └─ semantic.events / semantic.items ──► translator.py (sqlglot) ──► engine.py (MetricFlow)
-                                                                                                        └─► SQL del motor
+cliente BI ──Postgres wire──► server.py (riffq; TLS opcional u obligatorio)
+                                 ├─ metadatos ──► catalogo_pg.py · DuckDB en memoria (tablas vacías + catálogo)
+                                 └─ semantic.<modelo> (aquí events, items) ──► translator.py (sqlglot) ──► engine.py (MetricFlow)
+                                                                                                        └─► executor.py (Athena) o SQL
 ```
 
 | Archivo | Rol |
@@ -490,8 +532,12 @@ cliente BI ──Postgres wire──► server.py (buenavista)
 | `MetricFlow/semantic_gateway/model.py` | Estructuras: `TableInfo`, `Catalog`, `SemanticQuery` |
 | `MetricFlow/semantic_gateway/translator.py` | SQL del cliente → `SemanticQuery`; valida que las columnas sean de la tabla consultada |
 | `MetricFlow/semantic_gateway/engine.py` | Carga el manifest, arma una tabla por modelo semántico y compila con MetricFlow, sin conexión |
-| `MetricFlow/semantic_gateway/server.py` | Servidor Postgres, catálogo DuckDB, motor por conexión y compatibilidad con drivers JDBC (Metabase) |
-| `MetricFlow/tests/` | `test_translator.py` y `test_gateway.py` |
+| `MetricFlow/semantic_gateway/executor.py` | Ejecuta en Athena el SQL compilado (`--ejecutar`): tiempo máximo con cancelación, límite de filas |
+| `MetricFlow/semantic_gateway/server.py` | Servidor Postgres sobre riffq (Rust, TLS, autenticación), motor por conexión y enrutamiento |
+| `MetricFlow/semantic_gateway/catalogo_pg.py` | Catálogo PostgreSQL en DuckDB y compatibilidad con los drivers (DBeaver, Metabase, Npgsql) |
+| `MetricFlow/semantic_gateway/tls_obligatorio.py` | Exige TLS delante de riffq (`--tls-obligatorio`) |
+| `MetricFlow/semantic_gateway/server_old.py` | Versión anterior sobre buenavista, como respaldo |
+| `MetricFlow/tests/` | `test_translator.py`, `test_gateway.py` y `probar_catalogo_riffq.py` |
 | `MetricFlow/notebooks/sqlglot_paso_a_paso.ipynb` | Recorrido del traductor paso a paso |
 
 Qué hace cada clase y función, quién la llama y a qué capa del ADR pertenece (serving layer, gateway o metric engine):
@@ -521,8 +567,13 @@ cp target/semantic_manifest.json ../../semantic_manifests/dbt_glue_lab/semantic_
 cd ../..                                    # raíz MetricFlow/
 python3 -m pip install -r requirements-gateway.txt
 python -m tests.test_translator             # traductor, sin base de datos
-python -m tests.test_gateway                # integración por protocolo Postgres
+python -m tests.test_gateway                # integración por protocolo Postgres (servidor riffq)
+SEMANTIC_GW_SERVER=old python -m tests.test_gateway   # lo mismo contra el servidor anterior (buenavista)
 ```
+
+riffq necesita Python 3.12 (Windows y Linux) o 3.14 (Mac Apple Silicon). Arquitectura y comandos de Windows: README
+de la raíz `MetricFlow/`. Consultas listas para usar: [docs/consultas_dbt_glue_lab.md](../../docs/consultas_dbt_glue_lab.md)
+e [it-people](../../docs/consultas_it_people.md).
 
 ### Levantar
 
@@ -531,11 +582,20 @@ python -m tests.test_gateway                # integración por protocolo Postgre
 python -m semantic_gateway --manifest semantic_manifests/dbt_glue_lab/semantic_manifest.json --motor athena                 # solo local
 python -m semantic_gateway --manifest semantic_manifests/dbt_glue_lab/semantic_manifest.json --motor athena --host 0.0.0.0  # Metabase en Docker
 python -m semantic_gateway --manifest semantic_manifests/it-people/semantic_manifest.json --motor athena --port 5434     # otro proyecto
+python -m semantic_gateway.server_old --manifest semantic_manifests/dbt_glue_lab/semantic_manifest.json --motor athena      # servidor anterior (buenavista)
+
+# ejecutando en Athena (filas al cliente, SQL al log) y con TLS obligatorio
+set -a; source DBT/dbt_glue_lab/.env; set +a
+python -m semantic_gateway --manifest semantic_manifests/dbt_glue_lab/semantic_manifest.json --motor athena \
+  --ejecutar --region us-east-1 --athena-workgroup primary --athena-output "s3://$DBT_S3_BUCKET/athena-results/" \
+  --tls-cert ../ssl/server.crt --tls-key ../ssl/server.key --tls-obligatorio
 ```
 
 Opciones: `--motor` (por defecto `athena`), `--host` (`127.0.0.1`), `--port` (`5433`), `--user`/`--password`
-(`bi`/`bi`), `--log-level` (`INFO`). También por variables `SEMANTIC_GW_*`. El manifest se lee al arrancar: después
-de cada `dbt parse` hay que reiniciar el gateway.
+(`bi`/`bi`), `--log-level` (`INFO`); ejecución: `--ejecutar`, `--athena-workgroup`, `--athena-output`, `--region`,
+`--aws-profile`, `--timeout` (100 s), `--max-filas`; TLS: `--tls-cert`, `--tls-key`, `--tls-obligatorio`. También
+por variables `SEMANTIC_GW_*`. El manifest se lee al arrancar: después de cada `dbt parse` hay que reiniciar el
+gateway. Detalle de cada opción: [docs/gateway_semantico.md, sección 10](../../docs/gateway_semantico.md#10-levantar-el-gateway).
 
 ### Credenciales de conexión
 
@@ -549,7 +609,7 @@ Credenciales por defecto del gateway (entorno local de pruebas):
 | Base de datos | Motor del SQL: `athena`, `snowflake`, `redshift`, `databricks`, `trino`, `bigquery`, `postgres` o `duckdb` | Igual que DBeaver |
 | Usuario | `bi` | `bi` |
 | Contraseña | `bi` | `bi` |
-| SSL | Desactivado | Desactivado |
+| SSL | Desactivado (`require` si el gateway usa TLS) | Igual que DBeaver |
 | Esquema | `semantic` | *Esquemas → Solo estos:* `semantic` |
 
 Cadena de conexión (JDBC, DBeaver): `jdbc:postgresql://127.0.0.1:5433/athena?user=bi&password=bi&sslmode=disable`
@@ -561,7 +621,7 @@ Requisitos y notas:
 * En DBeaver, en la pestaña *PostgreSQL* de la conexión, desactivar *Show all databases*.
 * En Metabase, poner el escaneo de valores de filtro en *Nunca* y pulsar *Sincronizar el esquema ahora*.
 * Usuario y clave se cambian con `--user` / `--password` o con `SEMANTIC_GW_USER` / `SEMANTIC_GW_PASSWORD`. `bi`/`bi`
-  es solo para pruebas locales: fuera de tu máquina, usar otra clave (el gateway aún no tiene TLS).
+  es solo para pruebas locales: fuera de tu máquina, usar otra clave y TLS (`--tls-cert`, `--tls-key`, `--tls-obligatorio`).
 
 ### Elegir el motor en la conexión
 
@@ -582,7 +642,7 @@ PGPASSWORD=bi psql "host=127.0.0.1 port=5433 user=bi dbname=snowflake"
 SELECT metric_time__month, event__platform, item_views
 FROM   semantic.events
 WHERE  event__platform IN ('ios','android') AND metric_time >= DATE '2024-01-01'
-ORDER  BY 1 LIMIT 100;                      -- devuelve e imprime el SQL de Snowflake; no ejecuta
+ORDER  BY 1 LIMIT 100;                      -- dbname=snowflake: devuelve el SQL de Snowflake (solo Athena se ejecuta)
 
 SELECT item__category, total_item_price FROM semantic.items;
 SELECT metric, label, type, table_name FROM semantic.metrics;
@@ -598,14 +658,13 @@ filtros sobre métricas y parámetros.
 ### Ejemplos para una plataforma de BI
 
 Cinco consultas típicas de un dashboard. Se escriben tal cual en el editor SQL de la herramienta: en Metabase,
-*Nuevo → Consulta SQL* sobre la conexión del gateway; en DBeaver, un *SQL Editor* sobre la conexión. Power BI usaría
-el conector PostgreSQL, pero eso aún no se ha probado.
+*Nuevo → Consulta SQL* sobre la conexión del gateway; en DBeaver, un *SQL Editor* sobre la conexión; en Power BI,
+*Base de datos PostgreSQL* con la consulta en *Opciones avanzadas* (modo Importar).
 
 Para cada ejemplo se muestra la consulta que escribe el analista, el SQL que genera el gateway (motor `athena`, sin
-los comentarios de MetricFlow) y qué resultado da ese SQL. **Hoy el gateway devuelve el SQL en la columna `sql`; el
-resultado descrito es el que se obtiene al ejecutar ese SQL en Athena.** Cuando exista el ejecutor (sección 15.7), el
-gateway devolverá esas filas directamente. Los alias numerados (`events_src_10000`, `subq_4`) cambian entre
-ejecuciones.
+los comentarios de MetricFlow) y qué resultado da. Con `--ejecutar` el gateway devuelve esas filas; sin esa opción
+devuelve el SQL en la columna `sql`. Los alias numerados (`events_src_10000`, `subq_4`) cambian entre ejecuciones.
+Más consultas, con su descripción: [docs/consultas_dbt_glue_lab.md](../../docs/consultas_dbt_glue_lab.md).
 
 #### 1. Tarjeta de KPI: actividad del año
 
@@ -933,20 +992,21 @@ consultas se escriben en *Nuevo → Consulta SQL*. Detalle en
 
 ### Limitaciones de esta versión
 
-* No devuelve datos, solo el SQL compilado; las tablas virtuales están vacías.
-* Un usuario con clave MD5, sin TLS, seguridad por filas, caché ni auditoría: solo en red privada.
+* Ejecuta solo en Athena (`--ejecutar`), con una única credencial de AWS para todos; otros motores reciben el SQL.
+  Las tablas virtuales del catálogo están vacías (la pestaña *Datos* de DBeaver no muestra filas).
+* Un usuario con clave fija (TLS opcional u obligatorio), sin seguridad por filas, caché ni auditoría: solo en red privada.
 * Tipos aproximados: tiempo `DATE`, resto de dimensiones `VARCHAR`, métricas `DOUBLE`.
 * El constructor visual de Metabase genera SQL que el traductor no acepta: usar consultas SQL nativas.
 * El manifest se carga solo al arrancar.
-* El motor por conexión y la compatibilidad JDBC enganchan el código interno de buenavista: al actualizarlo, correr
-  `python -m tests.test_gateway`.
+* El protocolo lo resuelve riffq (preversión 0.1.x). Al actualizarlo, correr `python -m tests.test_gateway`; la versión
+  anterior sobre buenavista sigue disponible en `server_old.py`.
 
 ## 12. Consumir desde Power BI
 
 | Opción | Cómo | Limitaciones |
 |---|---|---|
 | **Tablas gold + Athena** | Materializar métricas en modelos gold y leerlos con el conector Amazon Athena de Power BI | No usa el motor de MetricFlow; la definición queda duplicada en SQL/DAX |
-| **Gateway semántico (11 ter)** | Conector PostgreSQL de Power BI apuntando al gateway (servidor `host:5433`, base de datos = motor) | Hoy solo devuelve el SQL compilado; el SQL que genera Power BI (DirectQuery/Importar) probablemente requiera ampliar el traductor; no probado |
+| **Gateway semántico (11 ter)** | Conector PostgreSQL de Power BI apuntando al gateway (servidor `host:5433`, base de datos `athena`), con `--ejecutar` | Modo Importar: conecta y navega (catálogo de tipos de Npgsql, `DISCARD ALL` y errores a mitad de lote resueltos). DirectQuery: el SQL que genera Power BI (subconsultas, `SUM` sobre columnas) requiere ampliar el traductor. En Power BI Service hace falta un data gateway y, con TLS, un certificado de una CA de confianza |
 | **dbt Cloud Semantic Layer** | Conector oficial de Power BI (Preview, DirectQuery) | Requiere licencia dbt platform y Snowflake/BigQuery/Databricks/Redshift/Postgres/Trino; no soporta Glue |
 
 ---
@@ -963,10 +1023,12 @@ consultas se escriben en *Nuevo → Consulta SQL*. Detalle en
 | `mf query` sin `--explain` falla con "Table ... does not exist" | Con el perfil DuckDB las tablas no existen | Usar `--explain` |
 | Una dimensión no aparece para una métrica | No hay camino de join | Revisar `mf list dimensions --metrics <métrica>` (ver 8.4) |
 | `dbt run` usa el perfil equivocado | `DBT_PROFILES_DIR` quedó definido | `unset DBT_PROFILES_DIR` |
+| `Env var required but not provided: 'AWS_ACCOUNT_ID'` (o `DBT_S3_BUCKET`) | No se cargó `.env` en esta terminal | `set -a; source .env; set +a` (4.1) |
+| Glue/Iceberg: *Location does not exist* al crear `metricflow_time_spine` | Quedó en Glue una tabla huérfana de una corrida anterior, con la ubicación de otro bucket | Borrarla (`aws glue delete-table --database-name lab_data --name metricflow_time_spine`) y volver a correr `dbt run -s metricflow_time_spine` |
 | Metabase: *contraseña incorrecta* al conectar al gateway | Puerto vacío: Metabase usa 5432 | Poner `5433` (11 ter) |
 | DBeaver: *Scalar Function with name pg_get_partkeydef does not exist* | Gateway sin la compatibilidad con DBeaver | Actualizar `server.py` y reiniciar el gateway |
 | Metabase en Docker no llega al gateway | El gateway escucha solo en `127.0.0.1` | `--host 0.0.0.0` y host `host.docker.internal` |
-| *Table with name dbt_glue_lab does not exist* | Consulta de la versión anterior del gateway (tabla única) | Usar `semantic.events` o `semantic.items` |
+| *Table with name dbt_glue_lab does not exist* | Consulta de la versión anterior del gateway (tabla única) | Usar las tablas `semantic.<modelo>` (en este proyecto, `semantic.events` o `semantic.items`) |
 | Una métrica nueva no aparece en el gateway | El manifest se lee solo al arrancar | `dbt parse`, reiniciar el gateway y sincronizar en Metabase |
 
 Más errores del gateway: [docs/gateway_semantico.md, sección 15](../../docs/gateway_semantico.md#15-errores-frecuentes).
@@ -1084,25 +1146,25 @@ Esta sección compara lo que pide el ADR con lo que existe en este repositorio. 
 | --- | --- | --- | --- |
 | Semantic models | YAML con la spec nueva, manifest | Sobre modelos silver (el ADR pide Gold); sin owner ni SLA | — |
 | Metric engine | MetricFlow OSS embebido, solo compila, 8 dialectos | — | — |
-| Serving layer | Endpoint Postgres wire, traductor, catálogo, compatibilidad Metabase/DBeaver | Autenticación (un usuario MD5) | REST/GraphQL, MCP, Arrow Flight SQL, XMLA/DAX, OIDC/SAML |
-| Gateway | — | Enrutador (el cliente elige el dialecto), gestor del manifiesto (carga al arrancar) | Ejecución en motores, RLS/PII, caché, costo, auditoría |
+| Serving layer | Endpoint Postgres wire (riffq), traductor, catálogo, compatibilidad DBeaver/Metabase/Npgsql, TLS | Autenticación (un usuario fijo) | REST/GraphQL, MCP, Arrow Flight SQL, XMLA/DAX, OIDC/SAML |
+| Gateway | Ejecución en Athena (`--ejecutar`, tiempo máximo con cancelación) | Enrutador (el cliente elige el dialecto), gestor del manifiesto (carga al arrancar), log por consulta | Ejecución en otros motores, RLS/PII, caché, costo, auditoría |
 | Transversal | Pruebas automáticas, documentación | Validación manual (`dbt parse`, `mf validate-configs`) | CI/CD en GitHub Enterprise, OpenMetadata, observabilidad, despliegue en EKS |
 
-En una frase: **está construida la mitad «compilar» de la ruta de consulta** (pasos 1, 2 y 4 del ADR: petición →
-consulta semántica → SQL compilado). **Falta la mitad «gobernar y ejecutar»** (pasos 3, 5, 6 y 7: seguridad,
-caché, ejecución en el motor, auditoría y entrega de resultados).
+En una frase: **la ruta de consulta funciona de punta a punta en Athena** (petición → consulta semántica → SQL
+compilado → ejecución → filas al cliente). **Falta la parte de «gobernar»** (paso 3 y parte de 5 y 7: identidad por
+usuario, RLS/PII, caché, auditoría formal y otros motores).
 
 ### 15.2 Ruta de consulta del ADR, paso a paso
 
 | Paso del ADR | Estado | Dónde / qué falta |
 | --- | --- | --- |
-| 1. La presentation layer envía la petición al serving layer | Hecho (Postgres wire) | `server.py`. Probado con psql, Jupyter, Metabase y consultas de DBeaver |
-| 2. El serving layer autentica y traduce a consulta semántica | Parcial | Traducción hecha (`translator.py` → `SemanticQuery`). Autenticación: un usuario fijo MD5, sin IdP ni TLS |
+| 1. La presentation layer envía la petición al serving layer | Hecho (Postgres wire) | `server.py` sobre riffq. Probado con psql, Jupyter, DBeaver y Metabase; Power BI en modo Importar |
+| 2. El serving layer autentica y traduce a consulta semántica | Parcial | Traducción hecha (`translator.py` → `SemanticQuery`). Autenticación: un usuario fijo, sin IdP; TLS opcional u obligatorio (`--tls-obligatorio`) |
 | 3. El gateway autoriza, añade RLS/objeto/PII y revisa la caché | Pendiente | No existe capa gateway: `server.py` llama directo a `engine.py` |
 | 4. MetricFlow compila a SQL contra el `semantic_manifest.json` | Hecho | `engine.py` (`SemanticEngine.explain`), sin conexión |
-| 5. El gateway ejecuta el SQL en el compute engine con sus conectores | Pendiente | Hoy el SQL se imprime y se devuelve como texto |
-| 6. El compute engine ejecuta sobre la storage layer | Pendiente | Depende del paso 5 |
-| 7. Resultados → auditoría y caché → consumidor | Pendiente | Hoy el consumidor recibe el SQL, no los datos |
+| 5. El gateway ejecuta el SQL en el compute engine con sus conectores | Parcial | `executor.py` ejecuta en Athena con PyAthena (`--ejecutar`): tiempo máximo con cancelación (`StopQueryExecution`), límite de filas, log de bytes escaneados. Solo Athena y una credencial compartida |
+| 6. El compute engine ejecuta sobre la storage layer | Hecho (Athena) | Athena sobre Iceberg en S3 registrado en Glue; probado con los manifests `dbt_glue_lab` e `it-people` |
+| 7. Resultados → auditoría y caché → consumidor | Parcial | El consumidor recibe las filas con el orden y alias pedidos; el log registra cada consulta. Sin caché ni auditoría formal |
 
 ### 15.3 Componentes del ADR
 
@@ -1120,26 +1182,26 @@ caché, ejecución en el motor, auditoría y entrega de resultados).
 
 | Componente | Estado | Qué hay | Qué falta |
 | --- | --- | --- | --- |
-| Endpoint Postgres wire | Hecho (PoC) | `server.py` sobre buenavista; catálogo en DuckDB; compatibilidad JDBC (Metabase, DBeaver) | TLS; probar Power BI (DirectQuery vía on-premises data gateway) y MicroStrategy; medir rendimiento |
+| Endpoint Postgres wire | Hecho (PoC) | `server.py` sobre riffq (TLS opcional u obligatorio con `--tls-obligatorio`); catálogo en DuckDB; compatibilidad con Metabase, DBeaver y Npgsql. `server_old.py` (buenavista) como respaldo | Probar Power BI en DirectQuery (vía data gateway) y MicroStrategy; medir rendimiento |
 | Traductor de peticiones | Parcial | SQL simple → `SemanticQuery` (métricas, group by, filtros, rango de tiempo, orden, límite) | Aceptar el SQL que generan los BI (constructor de Metabase, DirectQuery de Power BI: `DATE_TRUNC`, `COUNT(*)`, subconsultas, parámetros) y `SELECT *` |
-| Vistas de consumo como tablas virtuales | Parcial | Una tabla por modelo semántico, generada desde el manifest (`semantic.events`, `semantic.items`) | Vistas de consumo curadas por dominio, si se definen en el YAML |
+| Vistas de consumo como tablas virtuales | Parcial | Una tabla por modelo semántico, generada desde cualquier manifest (aquí `semantic.events` y `semantic.items`; con IT People, `semantic.employee_headcount`) | Vistas de consumo curadas por dominio, si se definen en el YAML |
 | Exponer el catálogo de métricas y dimensiones | Hecho | `semantic.metrics`, `semantic.dimensions`, `semantic.metric_dimensions` | Agregar owner, SLA y glosario cuando vengan del YAML y de OpenMetadata |
 | API REST/GraphQL (data apps, notebooks) | Pendiente | — | Exponer el mismo `SemanticQuery` por HTTP |
 | Servidor MCP (agentes IA) | Pendiente | — | Servidor MCP sobre el mismo motor (listar métricas, consultar) |
 | Arrow Flight SQL (ADBC) | Pendiente | — | Fase posterior al MVP |
 | XMLA/DAX | Pendiente | — | Solo si la PoC demuestra que DirectQuery no basta |
-| Autenticación OIDC/SAML y Entra ID | Mínimo | Usuario `bi` con clave MD5 (`--user`/`--password`) | Integración con el IdP corporativo y Entra ID; identidad por consumidor |
+| Autenticación OIDC/SAML y Entra ID | Mínimo | Usuario y clave fijos (`--user`/`--password`) validados en `handle_auth`; TLS con `--tls-obligatorio` | Integración con el IdP corporativo y Entra ID; identidad por consumidor |
 
 **Gateway de orquestación**
 
 | Componente | Estado | Qué hay | Qué falta |
 | --- | --- | --- | --- |
-| Conectores de motor y enrutador | Parcial | Compila para athena, bigquery, databricks, duckdb, postgres, redshift, snowflake y trino; el cliente elige el dialecto con `dbname` | Ejecutar con los drivers oficiales de cada motor; elegir el motor según dónde vive el producto de datos; workgroups, timeouts y límites de escaneo |
+| Conectores de motor y enrutador | Parcial | Compila para athena, bigquery, databricks, duckdb, postgres, redshift, snowflake y trino; el cliente elige el dialecto con `dbname`. Ejecuta en Athena (workgroup, `--timeout` con cancelación, `--max-filas`) | Ejecutar en los demás motores; elegir el motor según dónde vive el producto de datos; límites de escaneo |
 | Inyección de seguridad (RLS, seguridad de objeto, PII) | Pendiente | El contrato `SemanticQuery` permite añadir filtros antes de compilar | Derivar políticas de OpenMetadata y Lake Formation; validar que el filtro se aplica en todas las rutas de join |
 | Caché de resultados | Pendiente | — | Caché con invalidación por snapshot de Iceberg o build de dbt |
 | Gestor del manifiesto | Mínimo | Lee el manifest de `semantic_manifests/` al arrancar | Carga en caliente del manifest que publica el CI (por ejemplo, desde S3) y versionado por entorno |
 | Límites de costo y aislamiento por dominio | Pendiente | — | Cuotas, workgroups y límites por dominio o por métrica, configurables sin cambiar código |
-| Auditoría | Pendiente | El log de consola registra conexión, motor y SQL compilado | Registro persistente por usuario, métrica, motor, costo y resultado |
+| Auditoría | Mínimo | El log de consola registra conexión, motor, SQL compilado, `query_id`, filas, segundos y bytes escaneados | Registro persistente por usuario, métrica, motor, costo y resultado |
 | Materialización gobernada | Pendiente | — | Solo cuando se requiera (patrón #10, si la PoC lo justifica) |
 
 **Transversal**
@@ -1158,8 +1220,8 @@ caché, ejecución en el motor, auditoría y entrega de resultados).
 | Requisito | Estado | Comentario |
 | --- | --- | --- |
 | Serving layer único | Parcial | Un endpoint por Postgres wire; faltan los demás protocolos y que los BI dejen de conectarse directo a los motores |
-| Multimotor | Parcial | Compila 8 dialectos; no ejecuta. Las rutas físicas del manifest son las de Glue: otros motores necesitan un manifest con rutas reescritas (sección 11) |
-| Los datos no se mueven (pushdown) | Hecho por diseño | El SQL compilado está pensado para ejecutarse en el motor; no se copian datos. Se verá en la práctica cuando exista el ejecutor |
+| Multimotor | Parcial | Compila 8 dialectos; ejecuta solo en Athena. Las rutas físicas del manifest son las de Glue: otros motores necesitan un manifest con rutas reescritas (sección 11) |
+| Los datos no se mueven (pushdown) | Hecho | Athena calcula sobre las tablas Iceberg; el gateway solo recibe el resultado agregado |
 | Protocolos: Postgres wire (MVP), REST/GraphQL y MCP | Parcial | Solo Postgres wire |
 | Métricas como código | Parcial | YAML en git; falta CI en GitHub Enterprise |
 | Métricas certificadas (owner, SLA) | Pendiente | — |
@@ -1170,7 +1232,7 @@ caché, ejecución en el motor, auditoría y entrega de resultados).
 
 | Consumidor | Patrón del ADR | Estado en el laboratorio |
 | --- | --- | --- |
-| Power BI | Conector PostgreSQL en DirectQuery vía on-premises data gateway | No probado. Es el riesgo «paridad con Power BI» del ADR |
+| Power BI | Conector PostgreSQL en DirectQuery vía on-premises data gateway | Importar: conecta y navega, tras adaptar el catálogo a Npgsql. DirectQuery: pendiente (requiere ampliar el traductor). Es el riesgo «paridad con Power BI» del ADR |
 | MicroStrategy | Fuente PostgreSQL genérica | No probado |
 | Metabase | Fuente PostgreSQL; cada vista de consumo como una tabla | Probado: conexión, sincronización de esquema y SQL nativo. El constructor visual aún no |
 | Agentes IA | Solo vía MCP | Pendiente (no hay servidor MCP) |
@@ -1180,27 +1242,28 @@ caché, ejecución en el motor, auditoría y entrega de resultados).
 
 | Riesgo del ADR | Qué se sabe hoy |
 | --- | --- |
-| Cobertura de motores de MetricFlow («Athena está por validar») | MetricFlow **compila** SQL de Athena sin errores para las 11 métricas. Falta **ejecutarlo** en Athena y comparar contra un conteo directo |
-| Paridad con Power BI (DirectQuery sobre Postgres wire) | Sin probar. Metabase y DBeaver obligaron a adaptar el catálogo: es esperable lo mismo con Power BI |
+| Cobertura de motores de MetricFlow («Athena está por validar») | MetricFlow compila SQL de Athena para las 11 métricas y el gateway lo **ejecuta** en Athena (manifests `dbt_glue_lab` e `it-people`). Falta comparar sistemáticamente contra conteos directos |
+| Paridad con Power BI (DirectQuery sobre Postgres wire) | Modo Importar funcionando tras adaptar el catálogo a Npgsql (tipos, `DISCARD ALL`, errores a mitad de lote). DirectQuery sin probar: requiere ampliar el traductor |
 | Divergencia del formato del modelo (dbt 1.12 eliminó `measures`) | El proyecto ya usa la spec nueva; MetricFlow fijado en 0.213.0 |
-| Rendimiento y costo en Athena | Sin medir: requiere el ejecutor, la caché y workgroups |
+| Rendimiento y costo en Athena | El log registra segundos y bytes escaneados por consulta; falta medirlo con carga real y agregar caché |
 | Dependencia de MetricFlow OSS | Mitigado en el diseño: MetricFlow está aislado tras `SemanticEngine` |
 
 ### 15.7 Hoja de ruta sugerida para cerrar el MVP
 
 Orden propuesto, de lo que más desbloquea a lo que más depende de otras piezas:
 
-1. **Ejecutor y enrutador.** Ejecutar el SQL compilado en Athena con el SDK oficial y devolver filas reales.
-   Comparar resultados contra consultas directas (atributo «functional correctness»). Después, Snowflake o Redshift.
+1. **Ejecutor y enrutador.** Hecho para Athena (`--ejecutar`). Falta comparar resultados contra consultas directas
+   (atributo «functional correctness») y sumar Snowflake o Redshift.
 2. **Capa gateway explícita** entre traductor y motor, recibiendo `SemanticQuery`: autorización, inyección de
    RLS/objeto/PII y auditoría.
-3. **Autenticación real y TLS**: OIDC/SAML con el IdP corporativo y Entra ID; cuenta de servicio por motor.
+3. **Autenticación real**: OIDC/SAML con el IdP corporativo y Entra ID; cuenta de servicio por motor. TLS ya está
+   (`--tls-obligatorio`); en producción falta un certificado de la CA corporativa.
 4. **Caché** con invalidación por snapshot de Iceberg o build de dbt; límites de escaneo y workgroups.
 5. **Gestor del manifiesto**: el CI publica el manifest por entorno y el gateway lo recarga en caliente.
 6. **CI/CD en GitHub Enterprise**: validación del modelo, atributos obligatorios (owner, SLA), CODEOWNERS por
    dominio, y despliegue del runtime en EKS con alta disponibilidad.
-7. **Prueba con Power BI** (DirectQuery vía on-premises data gateway) y MicroStrategy, con informes reales; ampliar
-   el traductor al SQL que generan.
+7. **Power BI en DirectQuery** (vía on-premises data gateway) y MicroStrategy, con informes reales; ampliar el
+   traductor al SQL que generan (el modo Importar ya funciona).
 8. **Semantic models sobre Gold** y atributos de certificación en el YAML.
 9. **Observabilidad**: latencia p95, errores, costo y uso por métrica, dominio y consumidor.
 10. **Nuevos protocolos**: API REST/GraphQL y servidor MCP sobre el mismo motor.
